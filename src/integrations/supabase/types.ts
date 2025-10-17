@@ -16,6 +16,7 @@ export type Database = {
     Tables: {
       actions: {
         Row: {
+          assigned_to: string | null
           commentaire: string | null
           created_at: string
           date: string
@@ -27,6 +28,7 @@ export type Database = {
           user_id: string
         }
         Insert: {
+          assigned_to?: string | null
           commentaire?: string | null
           created_at?: string
           date: string
@@ -38,6 +40,7 @@ export type Database = {
           user_id: string
         }
         Update: {
+          assigned_to?: string | null
           commentaire?: string | null
           created_at?: string
           date?: string
@@ -49,6 +52,13 @@ export type Database = {
           user_id?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "actions_assigned_to_fkey"
+            columns: ["assigned_to"]
+            isOneToOne: false
+            referencedRelation: "utilisateurs_internes"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "actions_etablissement_id_fkey"
             columns: ["etablissement_id"]
@@ -265,6 +275,39 @@ export type Database = {
           id?: string
           nom?: string
           prenom?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      utilisateurs_internes: {
+        Row: {
+          created_at: string
+          email: string
+          id: string
+          nom: string
+          prenom: string
+          role: string | null
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          email: string
+          id?: string
+          nom: string
+          prenom: string
+          role?: string | null
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          email?: string
+          id?: string
+          nom?: string
+          prenom?: string
+          role?: string | null
           updated_at?: string
           user_id?: string
         }

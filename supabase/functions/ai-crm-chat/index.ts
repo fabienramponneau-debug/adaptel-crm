@@ -10,34 +10,62 @@ const corsHeaders = {
 // System prompt for the AI assistant
 const SYSTEM_PROMPT = `Tu es un assistant commercial intelligent pour ADAPTEL Lyon, une agence d'intérim.
 
-Tu dois comprendre les demandes en langage naturel et effectuer les actions suivantes :
+Tu as une MÉMOIRE CONVERSATIONNELLE : tu te souviens du contexte des échanges précédents dans la conversation.
 
 **ACTIONS DISPONIBLES:**
 
 1. AJOUTER un établissement, contact, action ou concurrence
 2. RECHERCHER/CONSULTER des informations
 3. ANALYSER les données (rappels, contacts manquants, etc.)
+4. ASSIGNER des tâches/rappels à des collaborateurs internes
 
 **RÈGLES IMPORTANTES:**
-- Extrais les informations importantes des phrases
-- Pour les établissements : nom, adresse, type (client/prospect), secteur, statut
-- Pour les contacts : nom, prénom, fonction, téléphone, email
-- Pour les actions : type (appel/visite/mail/autre), date, commentaire, résultat
-- Pour les dates de rappel : calcule la date exacte
-- Réponds toujours en français de manière professionnelle et concise
-- Confirme les actions effectuées
+
+1. **MÉMOIRE ET CONTEXTE:**
+   - Garde en mémoire les établissements, contacts et actions mentionnés dans la conversation
+   - Si l'utilisateur dit "Appelle le directeur mardi", comprends qu'il parle du dernier établissement/contact mentionné
+   - Ne redemande pas des infos déjà données dans la conversation récente
+
+2. **DATES NATURELLES:**
+   - Comprends "demain", "lundi prochain", "dans 3 jours", "la semaine prochaine"
+   - Date du jour : ${new Date().toISOString()}
+   - Calcule automatiquement les dates exactes au format ISO 8601
+
+3. **ASSIGNATION DE TÂCHES:**
+   - Quand on dit "Dis à [prénom] de...", cherche d'abord l'utilisateur interne correspondant
+   - Si plusieurs prénoms similaires, demande confirmation ("Tu veux dire Céline M. ?")
+   - Assigne l'action avec assigned_to
+
+4. **REFORMULATION ET CONFIRMATION:**
+   - Pour les infos ambiguës ou incomplètes, reformule avant d'enregistrer
+   - Exemples : "Tu veux dire le Novotel de Bron ou de Part-Dieu ?", "C'est pour Céline Martin du service commercial ?"
+
+5. **EXTRACTION D'INFOS:**
+   - Établissements : nom, adresse, type (client/prospect), secteur, statut
+   - Contacts : nom, prénom, fonction, téléphone, email
+   - Actions : type (appel/visite/mail/autre), date, commentaire, résultat, assigned_to
+   - Utilisateurs internes : prénom, nom
+
+6. **COMMUNICATION:**
+   - Réponds de manière naturelle et professionnelle
+   - Confirme les actions effectuées
+   - Reformule pour clarifier si nécessaire
 
 **EXEMPLES:**
+
 "J'ai rencontré le directeur du Novotel Bron hier" 
-→ Créer établissement Novotel Bron (prospect) + contact directeur + action visite
+→ Créer établissement + contact + action visite
 
 "Rappeler dans 10 jours"
-→ Créer une action de type rappel avec la date calculée
+→ Créer action avec date calculée automatiquement
 
-"Quels sont mes rappels de cette semaine?"
-→ Rechercher les actions de cette semaine
+"Dis à Céline d'appeler le Sofitel demain"
+→ Chercher Céline dans utilisateurs_internes + créer action assignée
 
-Utilise les outils disponibles pour effectuer les actions demandées.`;
+"Quels sont mes rappels cette semaine ?"
+→ Rechercher actions avec dates de cette semaine
+
+Utilise ta mémoire conversationnelle et les outils disponibles intelligemment.`;
 
 // Tools definition for structured output
 const tools = [
@@ -99,7 +127,8 @@ const tools = [
           },
           date: { type: "string", description: "Date de l'action au format ISO 8601" },
           commentaire: { type: "string", description: "Commentaire sur l'action" },
-          resultat: { type: "string", description: "Résultat de l'action" }
+          resultat: { type: "string", description: "Résultat de l'action" },
+          assigned_to_name: { type: "string", description: "Prénom du collaborateur interne à qui assigner la tâche (optionnel)" }
         },
         required: ["etablissement_nom", "type", "date"]
       }
@@ -155,6 +184,37 @@ const tools = [
           nom: { type: "string", description: "Nom de l'établissement" }
         },
         required: ["nom"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_internal_users",
+      description: "Rechercher des utilisateurs internes (collaborateurs ADAPTEL) par prénom ou nom",
+      parameters: {
+        type: "object",
+        properties: {
+          prenom: { type: "string", description: "Prénom à rechercher" },
+          nom: { type: "string", description: "Nom à rechercher" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_internal_user",
+      description: "Créer un nouvel utilisateur interne (collaborateur ADAPTEL)",
+      parameters: {
+        type: "object",
+        properties: {
+          nom: { type: "string", description: "Nom du collaborateur" },
+          prenom: { type: "string", description: "Prénom du collaborateur" },
+          email: { type: "string", description: "Email du collaborateur" },
+          role: { type: "string", description: "Rôle/fonction du collaborateur" }
+        },
+        required: ["nom", "prenom", "email"]
       }
     }
   }
@@ -291,6 +351,21 @@ serve(async (req) => {
                 break;
               }
 
+              // Handle assigned_to if provided (by internal user name)
+              let assignedToId = null;
+              if (args.assigned_to_name) {
+                const { data: internalUser } = await supabase
+                  .from('utilisateurs_internes')
+                  .select('id')
+                  .ilike('prenom', args.assigned_to_name)
+                  .limit(1)
+                  .single();
+                
+                if (internalUser) {
+                  assignedToId = internalUser.id;
+                }
+              }
+
               const { data: actionData, error: actionError } = await supabase
                 .from('actions')
                 .insert({
@@ -299,6 +374,7 @@ serve(async (req) => {
                   commentaire: args.commentaire,
                   resultat: args.resultat,
                   etablissement_id: etabForAction.id,
+                  assigned_to: assignedToId,
                   user_id: userId
                 })
                 .select()
@@ -361,6 +437,36 @@ serve(async (req) => {
               
               if (etabInfoError) throw etabInfoError;
               result = { success: true, data: etabInfo };
+              break;
+
+            case 'search_internal_users':
+              let userQuery = supabase
+                .from('utilisateurs_internes')
+                .select('*');
+              
+              if (args.prenom) userQuery = userQuery.ilike('prenom', `%${args.prenom}%`);
+              if (args.nom) userQuery = userQuery.ilike('nom', `%${args.nom}%`);
+              
+              const { data: internalUsers, error: usersError } = await userQuery;
+              if (usersError) throw usersError;
+              result = { success: true, data: internalUsers };
+              break;
+
+            case 'create_internal_user':
+              const { data: newUser, error: newUserError } = await supabase
+                .from('utilisateurs_internes')
+                .insert({
+                  nom: args.nom,
+                  prenom: args.prenom,
+                  email: args.email,
+                  role: args.role,
+                  user_id: userId
+                })
+                .select()
+                .single();
+              
+              if (newUserError) throw newUserError;
+              result = { success: true, data: newUser };
               break;
 
             default:
