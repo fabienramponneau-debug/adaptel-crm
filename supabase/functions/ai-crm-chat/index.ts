@@ -18,6 +18,9 @@ Tu as une MÉMOIRE CONVERSATIONNELLE : tu te souviens du contexte des échanges 
 2. RECHERCHER/CONSULTER des informations
 3. ANALYSER les données (rappels, contacts manquants, etc.)
 4. ASSIGNER des tâches/rappels à des collaborateurs internes
+5. FUSIONNER des établissements doublons
+6. SUPPRIMER (soft delete) des établissements/contacts
+7. DÉTECTER automatiquement les doublons lors des créations
 
 **RÈGLES IMPORTANTES:**
 
@@ -46,10 +49,18 @@ Tu as une MÉMOIRE CONVERSATIONNELLE : tu te souviens du contexte des échanges 
    - Actions : type (appel/visite/mail/autre), date, commentaire, résultat, assigned_to
    - Utilisateurs internes : prénom, nom
 
-6. **COMMUNICATION:**
+6. **GESTION DES DOUBLONS:**
+   - Avant de créer un établissement, vérifie automatiquement s'il existe déjà (même nom, même adresse ou ville)
+   - Si un doublon est détecté, propose à l'utilisateur de fusionner ou annuler
+   - Pour fusionner des doublons : garde l'établissement avec le plus de données, repointe les relations
+   - Les suppressions sont toujours "soft delete" (marquées comme supprimées, jamais effacées)
+   - Commandes acceptées : "Fusionne [A] avec [B]", "Supprime [X]", "Liste les doublons", "Déplace les contacts de [A] vers [B]"
+
+7. **COMMUNICATION:**
    - Réponds de manière naturelle et professionnelle
    - Confirme les actions effectuées
    - Reformule pour clarifier si nécessaire
+   - Alerte en cas de doublon détecté
 
 **EXEMPLES:**
 
@@ -64,6 +75,12 @@ Tu as une MÉMOIRE CONVERSATIONNELLE : tu te souviens du contexte des échanges 
 
 "Quels sont mes rappels cette semaine ?"
 → Rechercher actions avec dates de cette semaine
+
+"Fusionne les doublons de Novotel"
+→ Détecter les doublons + proposer fusion
+
+"Supprime le doublon Pullman Lyon"
+→ Soft delete de l'établissement
 
 Utilise ta mémoire conversationnelle et les outils disponibles intelligemment.`;
 
@@ -217,6 +234,64 @@ const tools = [
         required: ["nom", "prenom", "email"]
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "detect_duplicates",
+      description: "Détecter les établissements doublons par nom similaire",
+      parameters: {
+        type: "object",
+        properties: {
+          nom: { type: "string", description: "Nom de l'établissement à vérifier" }
+        },
+        required: ["nom"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "merge_etablissements",
+      description: "Fusionner deux établissements doublons (garde le maître, repointe les relations)",
+      parameters: {
+        type: "object",
+        properties: {
+          nom_maitre: { type: "string", description: "Nom de l'établissement à garder (maître)" },
+          nom_doublon: { type: "string", description: "Nom de l'établissement doublon à fusionner" }
+        },
+        required: ["nom_maitre", "nom_doublon"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "soft_delete_etablissement",
+      description: "Supprimer (soft delete) un établissement",
+      parameters: {
+        type: "object",
+        properties: {
+          nom: { type: "string", description: "Nom de l'établissement à supprimer" }
+        },
+        required: ["nom"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "move_contacts",
+      description: "Déplacer tous les contacts d'un établissement vers un autre",
+      parameters: {
+        type: "object",
+        properties: {
+          nom_source: { type: "string", description: "Nom de l'établissement source" },
+          nom_destination: { type: "string", description: "Nom de l'établissement de destination" }
+        },
+        required: ["nom_source", "nom_destination"]
+      }
+    }
   }
 ];
 
@@ -288,6 +363,32 @@ serve(async (req) => {
         try {
           switch (functionName) {
             case 'create_etablissement':
+              // Check for duplicates first
+              const createNomLower = args.nom.toLowerCase().replace(/\s+/g, '');
+              
+              const { data: existingEtabs } = await supabase
+                .from('etablissements')
+                .select('*')
+                .eq('user_id', userId)
+                .is('deleted_at', null);
+              
+              const foundDuplicates = existingEtabs?.filter(e => {
+                const existingNomLower = e.nom.toLowerCase().replace(/\s+/g, '');
+                return existingNomLower === createNomLower || 
+                       (e.adresse && args.adresse && e.adresse.toLowerCase().includes(args.adresse.toLowerCase()));
+              }) || [];
+              
+              if (foundDuplicates.length > 0) {
+                result = { 
+                  success: false, 
+                  warning: 'duplicate_detected',
+                  data: foundDuplicates,
+                  message: `⚠️ Attention : Il existe déjà ${foundDuplicates.length} établissement(s) similaire(s). Souhaitez-vous fusionner ou annuler la création ?`
+                };
+                break;
+              }
+
+              // No duplicates, proceed with creation
               const { data: etabData, error: etabError } = await supabase
                 .from('etablissements')
                 .insert({
@@ -467,6 +568,177 @@ serve(async (req) => {
               
               if (newUserError) throw newUserError;
               result = { success: true, data: newUser };
+              break;
+
+            case 'detect_duplicates':
+              const nomLower = args.nom.toLowerCase().replace(/\s+/g, '');
+              
+              const { data: allEtabs } = await supabase
+                .from('etablissements')
+                .select('*')
+                .eq('user_id', userId)
+                .is('deleted_at', null);
+              
+              const duplicates = allEtabs?.filter(e => 
+                e.nom.toLowerCase().replace(/\s+/g, '').includes(nomLower) ||
+                nomLower.includes(e.nom.toLowerCase().replace(/\s+/g, ''))
+              ) || [];
+              
+              result = { 
+                success: true, 
+                data: duplicates,
+                message: duplicates.length > 0 
+                  ? `${duplicates.length} doublon(s) détecté(s)` 
+                  : 'Aucun doublon détecté'
+              };
+              break;
+
+            case 'merge_etablissements':
+              // Find both establishments
+              const { data: maitreEtab } = await supabase
+                .from('etablissements')
+                .select('*')
+                .eq('nom', args.nom_maitre)
+                .eq('user_id', userId)
+                .is('deleted_at', null)
+                .single();
+              
+              const { data: doublonEtab } = await supabase
+                .from('etablissements')
+                .select('*')
+                .eq('nom', args.nom_doublon)
+                .eq('user_id', userId)
+                .is('deleted_at', null)
+                .single();
+              
+              if (!maitreEtab || !doublonEtab) {
+                result = { success: false, error: 'Un ou plusieurs établissements non trouvés' };
+                break;
+              }
+
+              // Merge non-empty fields from doublon to maitre
+              const mergedData: any = { ...maitreEtab };
+              if (!mergedData.adresse && doublonEtab.adresse) mergedData.adresse = doublonEtab.adresse;
+              if (!mergedData.secteur && doublonEtab.secteur) mergedData.secteur = doublonEtab.secteur;
+              if (!mergedData.statut && doublonEtab.statut) mergedData.statut = doublonEtab.statut;
+              if (!mergedData.notes && doublonEtab.notes) mergedData.notes = doublonEtab.notes;
+
+              // Update maitre with merged data
+              await supabase
+                .from('etablissements')
+                .update(mergedData)
+                .eq('id', maitreEtab.id);
+
+              // Repoint all relations from doublon to maitre
+              await supabase
+                .from('contacts')
+                .update({ etablissement_id: maitreEtab.id })
+                .eq('etablissement_id', doublonEtab.id);
+              
+              await supabase
+                .from('actions')
+                .update({ etablissement_id: maitreEtab.id })
+                .eq('etablissement_id', doublonEtab.id);
+              
+              await supabase
+                .from('concurrence')
+                .update({ etablissement_id: maitreEtab.id })
+                .eq('etablissement_id', doublonEtab.id);
+
+              // Soft delete the doublon
+              await supabase
+                .from('etablissements')
+                .update({ deleted_at: new Date().toISOString() })
+                .eq('id', doublonEtab.id);
+
+              // Log merge in historique
+              await supabase.from('historique').insert({
+                action: 'merge',
+                data: {
+                  table_cible: 'etablissements',
+                  maitre_id: maitreEtab.id,
+                  doublon_id: doublonEtab.id,
+                  nom_maitre: args.nom_maitre,
+                  nom_doublon: args.nom_doublon
+                },
+                user_id: userId
+              });
+
+              result = { 
+                success: true, 
+                message: `Fusion réussie : ${args.nom_doublon} fusionné dans ${args.nom_maitre}`
+              };
+              break;
+
+            case 'soft_delete_etablissement':
+              const { data: etabToDelete } = await supabase
+                .from('etablissements')
+                .select('id')
+                .eq('nom', args.nom)
+                .eq('user_id', userId)
+                .is('deleted_at', null)
+                .single();
+              
+              if (!etabToDelete) {
+                result = { success: false, error: 'Établissement non trouvé ou déjà supprimé' };
+                break;
+              }
+
+              await supabase
+                .from('etablissements')
+                .update({ deleted_at: new Date().toISOString() })
+                .eq('id', etabToDelete.id);
+
+              // Log deletion
+              await supabase.from('historique').insert({
+                action: 'delete',
+                data: {
+                  table_cible: 'etablissements',
+                  etablissement_id: etabToDelete.id,
+                  nom: args.nom
+                },
+                user_id: userId
+              });
+
+              result = { 
+                success: true, 
+                message: `Établissement "${args.nom}" supprimé (soft delete)`
+              };
+              break;
+
+            case 'move_contacts':
+              const { data: sourceEtab } = await supabase
+                .from('etablissements')
+                .select('id')
+                .eq('nom', args.nom_source)
+                .eq('user_id', userId)
+                .is('deleted_at', null)
+                .single();
+              
+              const { data: destEtab } = await supabase
+                .from('etablissements')
+                .select('id')
+                .eq('nom', args.nom_destination)
+                .eq('user_id', userId)
+                .is('deleted_at', null)
+                .single();
+              
+              if (!sourceEtab || !destEtab) {
+                result = { success: false, error: 'Un ou plusieurs établissements non trouvés' };
+                break;
+              }
+
+              const { data: movedContacts } = await supabase
+                .from('contacts')
+                .update({ etablissement_id: destEtab.id })
+                .eq('etablissement_id', sourceEtab.id)
+                .select();
+
+              result = { 
+                success: true, 
+                data: movedContacts,
+                message: `${movedContacts?.length || 0} contact(s) déplacé(s) de ${args.nom_source} vers ${args.nom_destination}`
+              };
               break;
 
             default:

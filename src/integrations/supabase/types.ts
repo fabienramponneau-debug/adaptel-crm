@@ -20,6 +20,7 @@ export type Database = {
           commentaire: string | null
           created_at: string
           date: string
+          deleted_at: string | null
           etablissement_id: string
           id: string
           resultat: string | null
@@ -32,6 +33,7 @@ export type Database = {
           commentaire?: string | null
           created_at?: string
           date: string
+          deleted_at?: string | null
           etablissement_id: string
           id?: string
           resultat?: string | null
@@ -44,6 +46,7 @@ export type Database = {
           commentaire?: string | null
           created_at?: string
           date?: string
+          deleted_at?: string | null
           etablissement_id?: string
           id?: string
           resultat?: string | null
@@ -123,6 +126,7 @@ export type Database = {
       contacts: {
         Row: {
           created_at: string
+          deleted_at: string | null
           email: string | null
           etablissement_id: string
           fonction: string | null
@@ -135,6 +139,7 @@ export type Database = {
         }
         Insert: {
           created_at?: string
+          deleted_at?: string | null
           email?: string | null
           etablissement_id: string
           fonction?: string | null
@@ -147,6 +152,7 @@ export type Database = {
         }
         Update: {
           created_at?: string
+          deleted_at?: string | null
           email?: string | null
           etablissement_id?: string
           fonction?: string | null
@@ -178,6 +184,7 @@ export type Database = {
         Row: {
           adresse: string | null
           created_at: string
+          deleted_at: string | null
           id: string
           nom: string
           notes: string | null
@@ -190,6 +197,7 @@ export type Database = {
         Insert: {
           adresse?: string | null
           created_at?: string
+          deleted_at?: string | null
           id?: string
           nom: string
           notes?: string | null
@@ -202,6 +210,7 @@ export type Database = {
         Update: {
           adresse?: string | null
           created_at?: string
+          deleted_at?: string | null
           id?: string
           nom?: string
           notes?: string | null

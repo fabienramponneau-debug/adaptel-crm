@@ -60,6 +60,7 @@ CREATE TABLE public.etablissements (
   statut text,
   notes text,
   secteur text,
+  deleted_at timestamp with time zone,
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
@@ -74,6 +75,7 @@ CREATE TABLE public.contacts (
   email text,
   telephone text,
   fonction text,
+  deleted_at timestamp with time zone,
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
@@ -88,6 +90,7 @@ CREATE TABLE public.actions (
   commentaire text,
   resultat text,
   assigned_to uuid,
+  deleted_at timestamp with time zone,
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
@@ -198,7 +201,7 @@ CREATE POLICY "Users can update their own profile"
 CREATE POLICY "Users can view their own etablissements"
   ON public.etablissements
   FOR SELECT
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id AND deleted_at IS NULL);
 
 CREATE POLICY "Users can create their own etablissements"
   ON public.etablissements
@@ -219,7 +222,7 @@ CREATE POLICY "Users can delete their own etablissements"
 CREATE POLICY "Users can view their own contacts"
   ON public.contacts
   FOR SELECT
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id AND deleted_at IS NULL);
 
 CREATE POLICY "Users can create their own contacts"
   ON public.contacts
@@ -240,7 +243,7 @@ CREATE POLICY "Users can delete their own contacts"
 CREATE POLICY "Users can view their own actions"
   ON public.actions
   FOR SELECT
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id AND deleted_at IS NULL);
 
 CREATE POLICY "Users can create their own actions"
   ON public.actions
@@ -319,6 +322,12 @@ CREATE INDEX idx_concurrence_user_id ON public.concurrence(user_id);
 CREATE INDEX idx_concurrence_etablissement_id ON public.concurrence(etablissement_id);
 CREATE INDEX idx_historique_user_id ON public.historique(user_id);
 CREATE INDEX idx_utilisateurs_internes_user_id ON public.utilisateurs_internes(user_id);
+
+-- Indexes for soft delete and duplicate detection
+CREATE INDEX IF NOT EXISTS idx_etablissements_deleted_at ON public.etablissements(deleted_at) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_contacts_deleted_at ON public.contacts(deleted_at) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_actions_deleted_at ON public.actions(deleted_at) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_etablissements_nom_lower ON public.etablissements(LOWER(REPLACE(nom, ' ', ''))) WHERE deleted_at IS NULL;
 
 -- ============================================
 -- END OF SCHEMA EXPORT
