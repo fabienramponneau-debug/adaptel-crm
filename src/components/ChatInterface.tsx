@@ -7,6 +7,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
 import MessageBubble from './MessageBubble';
 import ResultCard from './ResultCard';
+import RappelsBadge from './RappelsBadge';
 
 interface Message {
   id: string;
@@ -126,9 +127,12 @@ export default function ChatInterface({ userId }: { userId: string }) {
   return (
     <div className="flex flex-col h-screen bg-background">
       <div className="border-b bg-card p-4">
-        <div className="max-w-4xl mx-auto">
-          <h1 className="text-2xl font-bold text-primary">CRM ADAPTEL Lyon</h1>
-          <p className="text-sm text-muted-foreground">Assistant commercial intelligent</p>
+        <div className="max-w-4xl mx-auto flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-primary">CRM ADAPTEL Lyon</h1>
+            <p className="text-sm text-muted-foreground">Assistant commercial intelligent</p>
+          </div>
+          <RappelsBadge userId={userId} />
         </div>
       </div>
 

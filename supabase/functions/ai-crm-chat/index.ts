@@ -8,81 +8,30 @@ const corsHeaders = {
 };
 
 // System prompt for the AI assistant
-const SYSTEM_PROMPT = `Tu es un assistant commercial intelligent pour ADAPTEL Lyon, une agence d'intérim.
+const SYSTEM_PROMPT = `Tu es l'assistant IA du CRM ADAPTEL Lyon (agence de travail temporaire spécialisée en Hôtellerie/Restauration).
 
-Tu as une MÉMOIRE CONVERSATIONNELLE : tu te souviens du contexte des échanges précédents dans la conversation.
+MAPPING AUTOMATIQUE (zéro friction) :
+- "Client actuel Novotel Bron, coef 2.048, groupe ACCOR" → champs dédiés (coefficient, groupe, ville)
+- "Prospect Hôtel Y cherche cuisiniers" → info_libre={postes:['cuisine']}
+- "RDV demain 15h" → action + rappel_le automatique (1h avant si RDV, jour J 9h si tâche)
+- Tout hors schéma → info_libre jsonb
 
-**ACTIONS DISPONIBLES:**
+SECTEURS : hôtellerie, restauration, hôtellerie-restauration, restauration_collective
+SOUS-SECTEURS : hôtel_1..5_étoiles, EHPAD, crèche, scolaire, résidence_hôtelière, etc.
 
-1. AJOUTER un établissement, contact, action ou concurrence
-2. RECHERCHER/CONSULTER des informations
-3. ANALYSER les données (rappels, contacts manquants, etc.)
-4. ASSIGNER des tâches/rappels à des collaborateurs internes
-5. FUSIONNER des établissements doublons
-6. SUPPRIMER (soft delete) des établissements/contacts
-7. DÉTECTER automatiquement les doublons lors des créations
+DÉDUPLICATION INTELLIGENTE :
+- Vérifier nom_canonique + ville + aliases avant création
+- Si doublon SANS consigne : garder fiche avec + contacts/actions, sinon + récente
+- Fusion auto : re-router contacts/actions, soft delete doublon, log historique
+- "Fusionne X avec Y" : garde X comme maître
 
-**RÈGLES IMPORTANTES:**
+CONCURRENCE : postes[], secteur, coefficient_observe, statut (actif/historique/pressenti)
+RAPPELS : rappel_le automatique (RDV: 1h avant, tâche: jour J 9h)
+ASSIGNATIONS : "Dis à Céline..." → assigne_a
+SUPPRESSION : toujours soft delete (deleted_at)
 
-1. **MÉMOIRE ET CONTEXTE:**
-   - Garde en mémoire les établissements, contacts et actions mentionnés dans la conversation
-   - Si l'utilisateur dit "Appelle le directeur mardi", comprends qu'il parle du dernier établissement/contact mentionné
-   - Ne redemande pas des infos déjà données dans la conversation récente
-
-2. **DATES NATURELLES:**
-   - Comprends "demain", "lundi prochain", "dans 3 jours", "la semaine prochaine"
-   - Date du jour : ${new Date().toISOString()}
-   - Calcule automatiquement les dates exactes au format ISO 8601
-
-3. **ASSIGNATION DE TÂCHES:**
-   - Quand on dit "Dis à [prénom] de...", cherche d'abord l'utilisateur interne correspondant
-   - Si plusieurs prénoms similaires, demande confirmation ("Tu veux dire Céline M. ?")
-   - Assigne l'action avec assigned_to
-
-4. **REFORMULATION ET CONFIRMATION:**
-   - Pour les infos ambiguës ou incomplètes, reformule avant d'enregistrer
-   - Exemples : "Tu veux dire le Novotel de Bron ou de Part-Dieu ?", "C'est pour Céline Martin du service commercial ?"
-
-5. **EXTRACTION D'INFOS:**
-   - Établissements : nom, adresse, type (client/prospect), secteur, statut
-   - Contacts : nom, prénom, fonction, téléphone, email
-   - Actions : type (appel/visite/mail/autre), date, commentaire, résultat, assigned_to
-   - Utilisateurs internes : prénom, nom
-
-6. **GESTION DES DOUBLONS:**
-   - Avant de créer un établissement, vérifie automatiquement s'il existe déjà (même nom, même adresse ou ville)
-   - Si un doublon est détecté, propose à l'utilisateur de fusionner ou annuler
-   - Pour fusionner des doublons : garde l'établissement avec le plus de données, repointe les relations
-   - Les suppressions sont toujours "soft delete" (marquées comme supprimées, jamais effacées)
-   - Commandes acceptées : "Fusionne [A] avec [B]", "Supprime [X]", "Liste les doublons", "Déplace les contacts de [A] vers [B]"
-
-7. **COMMUNICATION:**
-   - Réponds de manière naturelle et professionnelle
-   - Confirme les actions effectuées
-   - Reformule pour clarifier si nécessaire
-   - Alerte en cas de doublon détecté
-
-**EXEMPLES:**
-
-"J'ai rencontré le directeur du Novotel Bron hier" 
-→ Créer établissement + contact + action visite
-
-"Rappeler dans 10 jours"
-→ Créer action avec date calculée automatiquement
-
-"Dis à Céline d'appeler le Sofitel demain"
-→ Chercher Céline dans utilisateurs_internes + créer action assignée
-
-"Quels sont mes rappels cette semaine ?"
-→ Rechercher actions avec dates de cette semaine
-
-"Fusionne les doublons de Novotel"
-→ Détecter les doublons + proposer fusion
-
-"Supprime le doublon Pullman Lyon"
-→ Soft delete de l'établissement
-
-Utilise ta mémoire conversationnelle et les outils disponibles intelligemment.`;
+Date du jour : ${new Date().toISOString()}
+Réponds en français de façon naturelle.`;
 
 // Tools definition for structured output
 const tools = [
@@ -90,20 +39,28 @@ const tools = [
     type: "function",
     function: {
       name: "create_etablissement",
-      description: "Créer un nouvel établissement",
+      description: "Créer un nouvel établissement (champs métier hôtellerie/restauration)",
       parameters: {
         type: "object",
         properties: {
           nom: { type: "string", description: "Nom de l'établissement" },
+          nom_affiche: { type: "string", description: "Nom d'affichage (optionnel)" },
           adresse: { type: "string", description: "Adresse de l'établissement" },
+          code_postal: { type: "string", description: "Code postal" },
+          ville: { type: "string", description: "Ville" },
           type: { 
             type: "string", 
-            enum: ["client", "prospect"],
+            enum: ["client_actuel", "prospect", "ancien_client"],
             description: "Type d'établissement"
           },
-          secteur: { type: "string", description: "Secteur d'activité" },
-          statut: { type: "string", description: "Statut actuel" },
-          notes: { type: "string", description: "Notes diverses" }
+          secteur: { type: "string", description: "Secteur: hôtellerie/restauration/hôtellerie-restauration/restauration_collective" },
+          sous_secteur: { type: "string", description: "Sous-secteur: hôtel_1..5_étoiles, EHPAD, crèche, scolaire, etc." },
+          statut_commercial: { type: "string", description: "Statut commercial" },
+          concurrent_principal: { type: "string", description: "Concurrent principal" },
+          coefficient: { type: "number", description: "Coefficient (ex: 2.048)" },
+          groupe: { type: "string", description: "Groupe (ex: ACCOR)" },
+          notes: { type: "string", description: "Notes diverses" },
+          info_libre: { type: "object", description: "Données hors schéma (jsonb)" }
         },
         required: ["nom", "type"]
       }
@@ -122,7 +79,10 @@ const tools = [
           prenom: { type: "string", description: "Prénom du contact" },
           fonction: { type: "string", description: "Fonction du contact" },
           telephone: { type: "string", description: "Téléphone du contact" },
-          email: { type: "string", description: "Email du contact" }
+          email: { type: "string", description: "Email du contact" },
+          preference_contact: { type: "string", description: "Préférence de contact" },
+          notes_contact: { type: "string", description: "Notes sur le contact" },
+          info_libre: { type: "object", description: "Données hors schéma (jsonb)" }
         },
         required: ["etablissement_nom", "nom", "prenom"]
       }
@@ -132,20 +92,23 @@ const tools = [
     type: "function",
     function: {
       name: "create_action",
-      description: "Créer une action commerciale ou un rappel",
+      description: "Créer une action commerciale ou un rappel (avec rappel_le auto si RDV/tâche)",
       parameters: {
         type: "object",
         properties: {
           etablissement_nom: { type: "string", description: "Nom de l'établissement" },
+          contact_nom: { type: "string", description: "Nom du contact lié (optionnel)" },
           type: { 
             type: "string", 
-            enum: ["appel", "visite", "mail", "autre"],
+            enum: ["appel", "visite", "mail", "rdv", "tache", "autre"],
             description: "Type d'action"
           },
           date: { type: "string", description: "Date de l'action au format ISO 8601" },
+          rappel_le: { type: "string", description: "Date du rappel (auto: RDV=1h avant, tâche=jour J 9h)" },
           commentaire: { type: "string", description: "Commentaire sur l'action" },
           resultat: { type: "string", description: "Résultat de l'action" },
-          assigned_to_name: { type: "string", description: "Prénom du collaborateur interne à qui assigner la tâche (optionnel)" }
+          assigne_a_name: { type: "string", description: "Prénom du collaborateur à qui assigner (optionnel)" },
+          info_libre: { type: "object", description: "Données hors schéma (jsonb)" }
         },
         required: ["etablissement_nom", "type", "date"]
       }
@@ -292,6 +255,59 @@ const tools = [
         required: ["nom_source", "nom_destination"]
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_concurrence",
+      description: "Créer ou mettre à jour une entrée de concurrence (postes, coefficient, statut)",
+      parameters: {
+        type: "object",
+        properties: {
+          etablissement_nom: { type: "string", description: "Nom de l'établissement" },
+          concurrent_principal: { type: "string", description: "Nom du concurrent" },
+          postes: { type: "array", items: { type: "string" }, description: "Postes concernés (ex: ['cuisine', 'service'])" },
+          secteur: { type: "string", description: "Secteur" },
+          sous_secteur: { type: "string", description: "Sous-secteur" },
+          coefficient_observe: { type: "number", description: "Coefficient observé" },
+          statut: { type: "string", enum: ["actif", "historique", "pressenti"], description: "Statut" },
+          date_debut: { type: "string", description: "Date début ISO 8601" },
+          date_fin: { type: "string", description: "Date fin ISO 8601" },
+          remarques: { type: "string", description: "Remarques" }
+        },
+        required: ["etablissement_nom", "concurrent_principal"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "query_concurrence",
+      description: "Interroger la concurrence (concurrent le plus présent, coef moyen, etc.)",
+      parameters: {
+        type: "object",
+        properties: {
+          concurrent: { type: "string", description: "Nom du concurrent à analyser" },
+          poste: { type: "string", description: "Poste à filtrer" },
+          secteur: { type: "string", description: "Secteur à filtrer" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_alias",
+      description: "Ajouter un alias pour un établissement (variantes de nom)",
+      parameters: {
+        type: "object",
+        properties: {
+          etablissement_nom: { type: "string", description: "Nom de l'établissement" },
+          alias: { type: "string", description: "Alias (variante du nom)" }
+        },
+        required: ["etablissement_nom", "alias"]
+      }
+    }
   }
 ];
 
@@ -363,9 +379,10 @@ serve(async (req) => {
         try {
           switch (functionName) {
             case 'create_etablissement':
-              // Check for duplicates first
-              const createNomLower = args.nom.toLowerCase().replace(/\s+/g, '');
+              // Normalize nom_canonique
+              const nomCanonique = args.nom.toLowerCase().replace(/\s+/g, '');
               
+              // Check for duplicates (nom_canonique, ville, aliases)
               const { data: existingEtabs } = await supabase
                 .from('etablissements')
                 .select('*')
@@ -373,31 +390,61 @@ serve(async (req) => {
                 .is('deleted_at', null);
               
               const foundDuplicates = existingEtabs?.filter(e => {
-                const existingNomLower = e.nom.toLowerCase().replace(/\s+/g, '');
-                return existingNomLower === createNomLower || 
-                       (e.adresse && args.adresse && e.adresse.toLowerCase().includes(args.adresse.toLowerCase()));
+                const existingNomLower = (e.nom_canonique || e.nom).toLowerCase().replace(/\s+/g, '');
+                return existingNomLower === nomCanonique || 
+                       (args.ville && e.ville && e.ville.toLowerCase() === args.ville.toLowerCase() && 
+                        existingNomLower.includes(nomCanonique.substring(0, 5)));
               }) || [];
+              
+              // Check aliases
+              if (foundDuplicates.length === 0) {
+                const { data: aliasMatches } = await supabase
+                  .from('etablissements_aliases')
+                  .select('etablissement_id')
+                  .ilike('alias', `%${args.nom}%`);
+                
+                if (aliasMatches && aliasMatches.length > 0) {
+                  const aliasEtabIds = aliasMatches.map(a => a.etablissement_id);
+                  const { data: aliasEtabs } = await supabase
+                    .from('etablissements')
+                    .select('*')
+                    .in('id', aliasEtabIds)
+                    .eq('user_id', userId)
+                    .is('deleted_at', null);
+                  
+                  if (aliasEtabs) foundDuplicates.push(...aliasEtabs);
+                }
+              }
               
               if (foundDuplicates.length > 0) {
                 result = { 
                   success: false, 
                   warning: 'duplicate_detected',
                   data: foundDuplicates,
-                  message: `⚠️ Attention : Il existe déjà ${foundDuplicates.length} établissement(s) similaire(s). Souhaitez-vous fusionner ou annuler la création ?`
+                  message: `⚠️ Doublon détecté: ${foundDuplicates.length} établissement(s) similaire(s). Fusionner ou annuler ?`
                 };
                 break;
               }
 
-              // No duplicates, proceed with creation
+              // No duplicates, create with full fields
               const { data: etabData, error: etabError } = await supabase
                 .from('etablissements')
                 .insert({
                   nom: args.nom,
+                  nom_affiche: args.nom_affiche,
+                  nom_canonique: nomCanonique,
                   adresse: args.adresse,
+                  code_postal: args.code_postal,
+                  ville: args.ville,
                   type: args.type,
                   secteur: args.secteur,
-                  statut: args.statut,
+                  sous_secteur: args.sous_secteur,
+                  statut_commercial: args.statut_commercial,
+                  concurrent_principal: args.concurrent_principal,
+                  coefficient: args.coefficient,
+                  groupe: args.groupe,
                   notes: args.notes,
+                  info_libre: args.info_libre,
                   user_id: userId
                 })
                 .select()
@@ -429,6 +476,9 @@ serve(async (req) => {
                   fonction: args.fonction,
                   telephone: args.telephone,
                   email: args.email,
+                  preference_contact: args.preference_contact,
+                  notes_contact: args.notes_contact,
+                  info_libre: args.info_libre,
                   etablissement_id: etabForContact.id,
                   user_id: userId
                 })
@@ -452,18 +502,45 @@ serve(async (req) => {
                 break;
               }
 
-              // Handle assigned_to if provided (by internal user name)
-              let assignedToId = null;
-              if (args.assigned_to_name) {
-                const { data: internalUser } = await supabase
-                  .from('utilisateurs_internes')
+              // Find contact if provided
+              let contactId = null;
+              if (args.contact_nom) {
+                const { data: contactForAction } = await supabase
+                  .from('contacts')
                   .select('id')
-                  .ilike('prenom', args.assigned_to_name)
+                  .eq('etablissement_id', etabForAction.id)
+                  .ilike('nom', `%${args.contact_nom}%`)
                   .limit(1)
                   .single();
                 
-                if (internalUser) {
-                  assignedToId = internalUser.id;
+                if (contactForAction) contactId = contactForAction.id;
+              }
+
+              // Handle assigne_a if provided
+              let assigneAId = null;
+              if (args.assigne_a_name) {
+                const { data: internalUser } = await supabase
+                  .from('utilisateurs_internes')
+                  .select('user_id')
+                  .ilike('prenom', args.assigne_a_name)
+                  .limit(1)
+                  .single();
+                
+                if (internalUser) assigneAId = internalUser.user_id;
+              }
+
+              // Auto-set rappel_le if not provided
+              let rappelLe = args.rappel_le;
+              if (!rappelLe && (args.type === 'rdv' || args.type === 'tache')) {
+                const actionDate = new Date(args.date);
+                if (args.type === 'rdv') {
+                  // 1h before
+                  rappelLe = new Date(actionDate.getTime() - 60 * 60 * 1000).toISOString();
+                } else {
+                  // Same day at 9am
+                  const rappelDate = new Date(actionDate);
+                  rappelDate.setHours(9, 0, 0, 0);
+                  rappelLe = rappelDate.toISOString();
                 }
               }
 
@@ -472,10 +549,13 @@ serve(async (req) => {
                 .insert({
                   type: args.type,
                   date: args.date,
+                  rappel_le: rappelLe,
                   commentaire: args.commentaire,
                   resultat: args.resultat,
+                  contact_id: contactId,
+                  assigne_a: assigneAId,
+                  info_libre: args.info_libre,
                   etablissement_id: etabForAction.id,
-                  assigned_to: assignedToId,
                   user_id: userId
                 })
                 .select()
@@ -739,6 +819,95 @@ serve(async (req) => {
                 data: movedContacts,
                 message: `${movedContacts?.length || 0} contact(s) déplacé(s) de ${args.nom_source} vers ${args.nom_destination}`
               };
+              break;
+
+            case 'manage_concurrence':
+              const { data: etabConcurrence } = await supabase
+                .from('etablissements')
+                .select('id')
+                .eq('nom', args.etablissement_nom)
+                .eq('user_id', userId)
+                .is('deleted_at', null)
+                .single();
+              
+              if (!etabConcurrence) {
+                result = { success: false, error: 'Établissement non trouvé' };
+                break;
+              }
+
+              const { data: concurrenceData, error: concurrenceError } = await supabase
+                .from('concurrence')
+                .insert({
+                  etablissement_id: etabConcurrence.id,
+                  user_id: userId,
+                  concurrent_principal: args.concurrent_principal,
+                  postes: args.postes,
+                  secteur: args.secteur,
+                  sous_secteur: args.sous_secteur,
+                  coefficient_observe: args.coefficient_observe,
+                  statut: args.statut || 'actif',
+                  date_debut: args.date_debut,
+                  date_fin: args.date_fin,
+                  remarques: args.remarques
+                })
+                .select()
+                .single();
+              
+              if (concurrenceError) throw concurrenceError;
+              result = { success: true, data: concurrenceData };
+              break;
+
+            case 'query_concurrence':
+              let concQuery = supabase
+                .from('concurrence')
+                .select('*, etablissements(nom, ville)')
+                .eq('user_id', userId)
+                .is('deleted_at', null);
+              
+              if (args.concurrent) concQuery = concQuery.ilike('concurrent_principal', `%${args.concurrent}%`);
+              if (args.secteur) concQuery = concQuery.eq('secteur', args.secteur);
+              if (args.poste) concQuery = concQuery.contains('postes', [args.poste]);
+              
+              const { data: concurrenceResults, error: concQueryError } = await concQuery;
+              if (concQueryError) throw concQueryError;
+              
+              result = { 
+                success: true, 
+                data: concurrenceResults,
+                summary: {
+                  total: concurrenceResults?.length || 0,
+                  coef_moyen: concurrenceResults?.length ? 
+                    (concurrenceResults.reduce((acc, c) => acc + (c.coefficient_observe || 0), 0) / concurrenceResults.length).toFixed(3) : 
+                    null
+                }
+              };
+              break;
+
+            case 'create_alias':
+              const { data: etabAlias } = await supabase
+                .from('etablissements')
+                .select('id')
+                .eq('nom', args.etablissement_nom)
+                .eq('user_id', userId)
+                .is('deleted_at', null)
+                .single();
+              
+              if (!etabAlias) {
+                result = { success: false, error: 'Établissement non trouvé' };
+                break;
+              }
+
+              const { data: aliasData, error: aliasError } = await supabase
+                .from('etablissements_aliases')
+                .insert({
+                  etablissement_id: etabAlias.id,
+                  alias: args.alias
+                })
+                .select()
+                .single();
+              
+              if (aliasError) throw aliasError;
+              result = { success: true, data: aliasData, message: `Alias "${args.alias}" ajouté` };
               break;
 
             default:
