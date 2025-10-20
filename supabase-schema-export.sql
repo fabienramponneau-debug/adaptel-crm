@@ -55,11 +55,21 @@ CREATE TABLE public.etablissements (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   nom text NOT NULL,
+  nom_affiche text,
+  nom_canonique text,
   adresse text,
+  code_postal text,
+  ville text,
   type text NOT NULL,
-  statut text,
-  notes text,
   secteur text,
+  sous_secteur text,
+  statut text,
+  statut_commercial text,
+  concurrent_principal text,
+  coefficient numeric(6,3),
+  groupe text,
+  notes text,
+  info_libre jsonb,
   deleted_at timestamp with time zone,
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   updated_at timestamp with time zone NOT NULL DEFAULT now()
@@ -75,6 +85,9 @@ CREATE TABLE public.contacts (
   email text,
   telephone text,
   fonction text,
+  preference_contact text,
+  notes_contact text,
+  info_libre jsonb,
   deleted_at timestamp with time zone,
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   updated_at timestamp with time zone NOT NULL DEFAULT now()
@@ -85,11 +98,15 @@ CREATE TABLE public.actions (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   etablissement_id uuid NOT NULL,
   user_id uuid NOT NULL,
+  contact_id uuid,
   type text NOT NULL,
   date timestamp with time zone NOT NULL,
+  rappel_le timestamp with time zone,
   commentaire text,
   resultat text,
   assigned_to uuid,
+  assigne_a uuid,
+  info_libre jsonb,
   deleted_at timestamp with time zone,
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   updated_at timestamp with time zone NOT NULL DEFAULT now()
@@ -101,9 +118,25 @@ CREATE TABLE public.concurrence (
   etablissement_id uuid NOT NULL,
   user_id uuid NOT NULL,
   concurrent_principal text,
+  postes text[],
+  secteur text,
+  sous_secteur text,
+  coefficient_observe numeric(6,3),
+  statut text DEFAULT 'actif',
+  date_debut timestamp with time zone,
+  date_fin timestamp with time zone,
   remarques text,
+  deleted_at timestamp with time zone,
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+-- Etablissements Aliases table
+CREATE TABLE public.etablissements_aliases (
+  id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+  etablissement_id uuid NOT NULL,
+  alias text NOT NULL,
+  created_at timestamp with time zone NOT NULL DEFAULT now()
 );
 
 -- Historique table
@@ -328,6 +361,16 @@ CREATE INDEX IF NOT EXISTS idx_etablissements_deleted_at ON public.etablissement
 CREATE INDEX IF NOT EXISTS idx_contacts_deleted_at ON public.contacts(deleted_at) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_actions_deleted_at ON public.actions(deleted_at) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_etablissements_nom_lower ON public.etablissements(LOWER(REPLACE(nom, ' ', ''))) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_etablissements_nom_canonique_lower ON public.etablissements(LOWER(REPLACE(nom_canonique, ' ', ''))) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_etablissements_active ON public.etablissements(user_id, nom_canonique, ville) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_etablissements_location ON public.etablissements(code_postal, ville) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_actions_rappel_le ON public.actions(rappel_le) WHERE deleted_at IS NULL AND rappel_le IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_actions_assigne_a ON public.actions(assigne_a) WHERE deleted_at IS NULL AND assigne_a IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_actions_contact_id ON public.actions(contact_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_concurrence_deleted_at ON public.concurrence(deleted_at) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_concurrence_statut ON public.concurrence(statut, etablissement_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_etablissements_aliases_etablissement ON public.etablissements_aliases(etablissement_id);
+CREATE INDEX IF NOT EXISTS idx_etablissements_aliases_normalized ON public.etablissements_aliases(etablissement_id, LOWER(REPLACE(alias, ' ', '')));
 
 -- ============================================
 -- END OF SCHEMA EXPORT

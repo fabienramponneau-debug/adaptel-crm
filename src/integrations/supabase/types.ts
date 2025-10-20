@@ -16,39 +16,51 @@ export type Database = {
     Tables: {
       actions: {
         Row: {
+          assigne_a: string | null
           assigned_to: string | null
           commentaire: string | null
+          contact_id: string | null
           created_at: string
           date: string
           deleted_at: string | null
           etablissement_id: string
           id: string
+          info_libre: Json | null
+          rappel_le: string | null
           resultat: string | null
           type: string
           updated_at: string
           user_id: string
         }
         Insert: {
+          assigne_a?: string | null
           assigned_to?: string | null
           commentaire?: string | null
+          contact_id?: string | null
           created_at?: string
           date: string
           deleted_at?: string | null
           etablissement_id: string
           id?: string
+          info_libre?: Json | null
+          rappel_le?: string | null
           resultat?: string | null
           type: string
           updated_at?: string
           user_id: string
         }
         Update: {
+          assigne_a?: string | null
           assigned_to?: string | null
           commentaire?: string | null
+          contact_id?: string | null
           created_at?: string
           date?: string
           deleted_at?: string | null
           etablissement_id?: string
           id?: string
+          info_libre?: Json | null
+          rappel_le?: string | null
           resultat?: string | null
           type?: string
           updated_at?: string
@@ -56,10 +68,24 @@ export type Database = {
         }
         Relationships: [
           {
+            foreignKeyName: "actions_assigne_a_fkey"
+            columns: ["assigne_a"]
+            isOneToOne: false
+            referencedRelation: "utilisateurs_internes"
+            referencedColumns: ["user_id"]
+          },
+          {
             foreignKeyName: "actions_assigned_to_fkey"
             columns: ["assigned_to"]
             isOneToOne: false
             referencedRelation: "utilisateurs_internes"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "actions_contact_id_fkey"
+            columns: ["contact_id"]
+            isOneToOne: false
+            referencedRelation: "contacts"
             referencedColumns: ["id"]
           },
           {
@@ -80,29 +106,53 @@ export type Database = {
       }
       concurrence: {
         Row: {
+          coefficient_observe: number | null
           concurrent_principal: string | null
           created_at: string
+          date_debut: string | null
+          date_fin: string | null
+          deleted_at: string | null
           etablissement_id: string
           id: string
+          postes: string[] | null
           remarques: string | null
+          secteur: string | null
+          sous_secteur: string | null
+          statut: string | null
           updated_at: string
           user_id: string
         }
         Insert: {
+          coefficient_observe?: number | null
           concurrent_principal?: string | null
           created_at?: string
+          date_debut?: string | null
+          date_fin?: string | null
+          deleted_at?: string | null
           etablissement_id: string
           id?: string
+          postes?: string[] | null
           remarques?: string | null
+          secteur?: string | null
+          sous_secteur?: string | null
+          statut?: string | null
           updated_at?: string
           user_id: string
         }
         Update: {
+          coefficient_observe?: number | null
           concurrent_principal?: string | null
           created_at?: string
+          date_debut?: string | null
+          date_fin?: string | null
+          deleted_at?: string | null
           etablissement_id?: string
           id?: string
+          postes?: string[] | null
           remarques?: string | null
+          secteur?: string | null
+          sous_secteur?: string | null
+          statut?: string | null
           updated_at?: string
           user_id?: string
         }
@@ -131,7 +181,10 @@ export type Database = {
           etablissement_id: string
           fonction: string | null
           id: string
+          info_libre: Json | null
           nom: string
+          notes_contact: string | null
+          preference_contact: string | null
           prenom: string
           telephone: string | null
           updated_at: string
@@ -144,7 +197,10 @@ export type Database = {
           etablissement_id: string
           fonction?: string | null
           id?: string
+          info_libre?: Json | null
           nom: string
+          notes_contact?: string | null
+          preference_contact?: string | null
           prenom: string
           telephone?: string | null
           updated_at?: string
@@ -157,7 +213,10 @@ export type Database = {
           etablissement_id?: string
           fonction?: string | null
           id?: string
+          info_libre?: Json | null
           nom?: string
+          notes_contact?: string | null
+          preference_contact?: string | null
           prenom?: string
           telephone?: string | null
           updated_at?: string
@@ -183,42 +242,72 @@ export type Database = {
       etablissements: {
         Row: {
           adresse: string | null
+          code_postal: string | null
+          coefficient: number | null
+          concurrent_principal: string | null
           created_at: string
           deleted_at: string | null
+          groupe: string | null
           id: string
+          info_libre: Json | null
           nom: string
+          nom_affiche: string | null
+          nom_canonique: string | null
           notes: string | null
           secteur: string | null
+          sous_secteur: string | null
           statut: string | null
+          statut_commercial: string | null
           type: string
           updated_at: string
           user_id: string
+          ville: string | null
         }
         Insert: {
           adresse?: string | null
+          code_postal?: string | null
+          coefficient?: number | null
+          concurrent_principal?: string | null
           created_at?: string
           deleted_at?: string | null
+          groupe?: string | null
           id?: string
+          info_libre?: Json | null
           nom: string
+          nom_affiche?: string | null
+          nom_canonique?: string | null
           notes?: string | null
           secteur?: string | null
+          sous_secteur?: string | null
           statut?: string | null
+          statut_commercial?: string | null
           type: string
           updated_at?: string
           user_id: string
+          ville?: string | null
         }
         Update: {
           adresse?: string | null
+          code_postal?: string | null
+          coefficient?: number | null
+          concurrent_principal?: string | null
           created_at?: string
           deleted_at?: string | null
+          groupe?: string | null
           id?: string
+          info_libre?: Json | null
           nom?: string
+          nom_affiche?: string | null
+          nom_canonique?: string | null
           notes?: string | null
           secteur?: string | null
+          sous_secteur?: string | null
           statut?: string | null
+          statut_commercial?: string | null
           type?: string
           updated_at?: string
           user_id?: string
+          ville?: string | null
         }
         Relationships: [
           {
@@ -227,6 +316,35 @@ export type Database = {
             isOneToOne: false
             referencedRelation: "profiles"
             referencedColumns: ["user_id"]
+          },
+        ]
+      }
+      etablissements_aliases: {
+        Row: {
+          alias: string
+          created_at: string
+          etablissement_id: string
+          id: string
+        }
+        Insert: {
+          alias: string
+          created_at?: string
+          etablissement_id: string
+          id?: string
+        }
+        Update: {
+          alias?: string
+          created_at?: string
+          etablissement_id?: string
+          id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "etablissements_aliases_etablissement_id_fkey"
+            columns: ["etablissement_id"]
+            isOneToOne: false
+            referencedRelation: "etablissements"
+            referencedColumns: ["id"]
           },
         ]
       }

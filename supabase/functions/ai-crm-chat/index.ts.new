@@ -1,0 +1,182 @@
+import "https://deno.land/x/xhr@0.1.0/mod.ts";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.3';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+const SYSTEM_PROMPT = `Tu es l'assistant IA du CRM ADAPTEL Lyon (agence de travail temporaire spécialisée en Hôtellerie/Restauration).
+
+MAPPING AUTOMATIQUE (zéro friction) :
+- "Client actuel Novotel Bron, coef 2.048, groupe ACCOR" → champs dédiés (coefficient, groupe, ville)
+- "Prospect Hôtel Y cherche cuisiniers" → info_libre={postes:['cuisine']}
+- "RDV demain 15h" → action + rappel_le automatique
+- Tout hors schéma → info_libre jsonb
+
+SECTEURS : hôtellerie, restauration, hôtellerie-restauration, restauration_collective
+SOUS-SECTEURS : hôtel_1..5_étoiles, EHPAD, crèche, scolaire, etc.
+
+DÉDUPLICATION INTELLIGENTE :
+- Vérifier nom_canonique + ville + aliases avant création
+- Si doublon SANS consigne : garder fiche avec + contacts/actions, sinon + récente
+- Fusion auto : re-router contacts/actions, soft delete doublon, log historique
+- "Fusionne X avec Y" : garde X comme maître
+
+CONCURRENCE : postes[], secteur, coefficient_observe, statut (actif/historique/pressenti)
+RAPPELS : rappel_le automatique (RDV: 1h avant, tâche: jour J 9h)
+ASSIGNATIONS : "Dis à Céline..." → assigne_a
+SUPPRESSION : toujours soft delete (deleted_at)
+
+Date du jour : ${new Date().toISOString()}
+Réponds en français de façon naturelle.`;
+
+const openAiUrl = "https://api.openai.com/v1/chat/completions";
+const openAiHeaders = {
+  "Content-Type": "application/json",
+  "Authorization": `Bearer ${Deno.env.get('OPENAI_API_KEY')}`,
+};
+
+async function generateAssistantResponse(messages: any[]) {
+  const requestBody = {
+    model: "gpt-4-1106-preview",
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...messages,
+    ],
+    temperature: 0.7,
+    max_tokens: 1000,
+    top_p: 1,
+    frequency_penalty: 0,
+    presence_penalty: 0,
+    n: 1,
+  };
+
+  const resp = await fetch(openAiUrl, {
+    method: "POST",
+    headers: openAiHeaders,
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!resp.ok) {
+    console.error('OpenAI API Error:', resp.status, resp.statusText, await resp.text());
+    throw new Error(`OpenAI API request failed with status ${resp.status}`);
+  }
+
+  const json = await resp.json();
+  console.log('OpenAI API Response:', json);
+
+  if (!json.choices || json.choices.length === 0) {
+    throw new Error('No choices returned from OpenAI API');
+  }
+
+  return json.choices[0].message.content;
+}
+
+async function runSQL(supabase: any, query: string) {
+  const { data, error } = await supabase.rpc('run_sql', { query });
+  if (error) {
+    console.error('Supabase runSQL error:', error);
+    throw new Error(`Supabase runSQL failed: ${error.message}`);
+  }
+  return data;
+}
+
+async function handleToolCall(supabase: any, toolCall: any, userId: string) {
+  console.log('Handling tool call:', toolCall);
+
+  if (toolCall.name === 'run_sql') {
+    if (toolCall.args && typeof toolCall.args === 'object' && 'query' in toolCall.args) {
+      const sqlQuery = toolCall.args.query;
+      console.log('Executing SQL query:', sqlQuery);
+      try {
+        const result = await runSQL(supabase, sqlQuery);
+        console.log('SQL query result:', result);
+        return JSON.stringify(result);
+      } catch (sqlError) {
+        console.error('Error executing SQL query:', sqlError);
+        return `Error executing SQL: ${sqlError.message}`;
+      }
+    } else {
+      console.error('Invalid arguments for run_sql tool call:', toolCall.args);
+      return 'Invalid arguments for run_sql tool call.';
+    }
+  } else if (toolCall.name === 'get_user_profile') {
+    try {
+      const { data: profile, error: profileError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('user_id', userId)
+        .single();
+
+      if (profileError) {
+        console.error('Error fetching profile:', profileError);
+        return `Error fetching profile: ${profileError.message}`;
+      }
+
+      console.log('User profile:', profile);
+      return JSON.stringify(profile);
+    } catch (error) {
+      console.error('Error in get_user_profile:', error);
+      return `Error in get_user_profile: ${error.message}`;
+    }
+  } else {
+    console.warn('Unknown tool call:', toolCall.name);
+    return `Unknown tool call: ${toolCall.name}`;
+  }
+}
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const { messages, userId } = await req.json();
+    if (!userId) throw new Error('userId is required');
+
+    const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
+    if (!LOVABLE_API_KEY) throw new Error('LOVABLE_API_KEY is not configured');
+
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    console.log('Processing AI request for user:', userId);
+
+    let aiResponseContent = await generateAssistantResponse(messages);
+    let aiResponse = { content: aiResponseContent };
+
+    // Tool handling
+    const toolCallRegex = /<tool_call>(.*?)<\/tool_call>/g;
+    let toolCallMatch;
+    while ((toolCallMatch = toolCallRegex.exec(aiResponseContent)) !== null) {
+      const toolCallStr = toolCallMatch[1];
+      try {
+        const toolCall = JSON.parse(toolCallStr);
+        if (toolCall && toolCall.name) {
+          const toolResult = await handleToolCall(supabase, toolCall, userId);
+          aiResponseContent = aiResponseContent.replace(toolCallMatch[0], `Tool Result: ${toolResult}`);
+          aiResponse = { content: aiResponseContent };
+        } else {
+          console.warn('Invalid tool call format:', toolCallStr);
+        }
+      } catch (parseError) {
+        console.error('Error parsing tool call:', parseError, toolCallStr);
+        aiResponseContent = aiResponseContent.replace(toolCallMatch[0], 'Error processing tool call.');
+        aiResponse = { content: aiResponseContent };
+      }
+    }
+    
+    return new Response(JSON.stringify(aiResponse), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+});
