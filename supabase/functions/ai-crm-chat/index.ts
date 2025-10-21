@@ -10,20 +10,37 @@ const corsHeaders = {
 // System prompt for the AI assistant
 const SYSTEM_PROMPT = `Tu es l'assistant IA du CRM ADAPTEL Lyon (agence de travail temporaire spécialisée en Hôtellerie/Restauration).
 
+CRÉATION TOLÉRANTE (JAMAIS BLOQUER) :
+- Toujours créer avec socle minimal : nom + user_id + type
+- Mapping automatique du type depuis la phrase utilisateur :
+  * "client actuel" → type='client', statut_commercial='gagné'
+  * "prospect" → type='prospect', statut_commercial='à_contacter'
+  * sinon défaut → type='prospect', statut_commercial='à_contacter'
+- Ne JAMAIS demander ville, coefficient, groupe, adresse, code_postal s'ils manquent
+- Créer d'abord avec le minimum, puis UPDATE les champs présents (nullable si manquants)
+- Si erreur DB (NOT NULL, FK, etc.) → retry avec création minimale automatique
+
 MAPPING AUTOMATIQUE (zéro friction) :
-- "Client actuel Novotel Bron, coef 2.048, groupe ACCOR" → champs dédiés (coefficient, groupe, ville)
-- "Prospect Hôtel Y cherche cuisiniers" → info_libre={postes:['cuisine']}
+- "Client actuel Novotel Bron (Bron), coef 2.048, groupe ACCOR" → type='client', statut_commercial='gagné', ville='Bron', coefficient=2.048, groupe='ACCOR'
+- "Prospect Hôtel Y (Lyon) — cherche cuisiniers" → type='prospect', statut_commercial='à_contacter', ville='Lyon', info_libre={postes:['cuisine']}
 - "RDV demain 15h" → action + rappel_le automatique (1h avant si RDV, jour J 9h si tâche)
+- "Dis à Céline d'appeler..." → assigne_a (via utilisateurs_internes)
 - Tout hors schéma → info_libre jsonb
 
 SECTEURS : hôtellerie, restauration, hôtellerie-restauration, restauration_collective
 SOUS-SECTEURS : hôtel_1..5_étoiles, EHPAD, crèche, scolaire, résidence_hôtelière, etc.
 
-DÉDUPLICATION INTELLIGENTE :
+DÉDUPLICATION SILENCIEUSE (par défaut) :
 - Vérifier nom_canonique + ville + aliases avant création
-- Si doublon SANS consigne : garder fiche avec + contacts/actions, sinon + récente
-- Fusion auto : re-router contacts/actions, soft delete doublon, log historique
-- "Fusionne X avec Y" : garde X comme maître
+- Si doublon probable détecté SANS consigne explicite :
+  * Garder fiche avec + contacts/actions, sinon + récente (updated_at → created_at)
+  * Fusion auto : re-router contacts/actions, soft delete doublon, log historique
+  * En égalité parfaite → une seule clarification (deux cartes synthèse), sinon auto
+- "Fusionne X avec Y" ou "Résous les doublons" → garde X comme maître ou auto-résolution
+
+NOM CANONIQUE & ALIASES :
+- Calcule automatiquement nom_canonique (minuscule, sans accents, sans espaces)
+- Si variante de nom détectée → crée etablissements_aliases SANS demander
 
 CONCURRENCE : postes[], secteur, coefficient_observe, statut (actif/historique/pressenti)
 RAPPELS : rappel_le automatique (RDV: 1h avant, tâche: jour J 9h)
@@ -31,7 +48,7 @@ ASSIGNATIONS : "Dis à Céline..." → assigne_a
 SUPPRESSION : toujours soft delete (deleted_at)
 
 Date du jour : ${new Date().toISOString()}
-Réponds en français de façon naturelle.`;
+Réponds en français de façon naturelle et JAMAIS BLOQUER sur champs manquants.`;
 
 // Tools definition for structured output
 const tools = [
@@ -39,30 +56,30 @@ const tools = [
     type: "function",
     function: {
       name: "create_etablissement",
-      description: "Créer un nouvel établissement (champs métier hôtellerie/restauration)",
+      description: "Créer un nouvel établissement. Mapping auto: 'client actuel'→type='client'+statut_commercial='gagné', 'prospect'→type='prospect'+statut_commercial='à_contacter'. JAMAIS bloquer si champs manquants (ville, coef, groupe, etc.)",
       parameters: {
         type: "object",
         properties: {
-          nom: { type: "string", description: "Nom de l'établissement" },
+          nom: { type: "string", description: "Nom de l'établissement (OBLIGATOIRE)" },
           nom_affiche: { type: "string", description: "Nom d'affichage (optionnel)" },
-          adresse: { type: "string", description: "Adresse de l'établissement" },
-          code_postal: { type: "string", description: "Code postal" },
-          ville: { type: "string", description: "Ville" },
+          adresse: { type: "string", description: "Adresse complète (optionnel)" },
+          code_postal: { type: "string", description: "Code postal (optionnel)" },
+          ville: { type: "string", description: "Ville (optionnel)" },
           type: { 
             type: "string", 
-            enum: ["client_actuel", "prospect", "ancien_client"],
-            description: "Type d'établissement"
+            enum: ["client", "prospect", "ancien_client"],
+            description: "Type: 'client' (si 'client actuel'), 'prospect' (défaut), 'ancien_client'"
           },
-          secteur: { type: "string", description: "Secteur: hôtellerie/restauration/hôtellerie-restauration/restauration_collective" },
-          sous_secteur: { type: "string", description: "Sous-secteur: hôtel_1..5_étoiles, EHPAD, crèche, scolaire, etc." },
-          statut_commercial: { type: "string", description: "Statut commercial" },
-          concurrent_principal: { type: "string", description: "Concurrent principal" },
-          coefficient: { type: "number", description: "Coefficient (ex: 2.048)" },
-          groupe: { type: "string", description: "Groupe (ex: ACCOR)" },
-          notes: { type: "string", description: "Notes diverses" },
-          info_libre: { type: "object", description: "Données hors schéma (jsonb)" }
+          secteur: { type: "string", description: "Secteur: hôtellerie/restauration/hôtellerie-restauration/restauration_collective (optionnel)" },
+          sous_secteur: { type: "string", description: "Sous-secteur: hôtel_1..5_étoiles, EHPAD, crèche, scolaire, etc. (optionnel)" },
+          statut_commercial: { type: "string", description: "Statut commercial: 'gagné' (si client actuel), 'à_contacter' (si prospect), etc. (optionnel)" },
+          concurrent_principal: { type: "string", description: "Concurrent principal (optionnel)" },
+          coefficient: { type: "number", description: "Coefficient commercial ex: 2.048 (optionnel)" },
+          groupe: { type: "string", description: "Groupe ex: ACCOR, B&B Hotels (optionnel)" },
+          notes: { type: "string", description: "Notes diverses (optionnel)" },
+          info_libre: { type: "object", description: "Données hors schéma jsonb ex: {postes:['cuisine']} (optionnel)" }
         },
-        required: ["nom", "type"]
+        required: ["nom"]
       }
     }
   },
@@ -379,79 +396,233 @@ serve(async (req) => {
         try {
           switch (functionName) {
             case 'create_etablissement':
-              // Normalize nom_canonique
-              const nomCanonique = args.nom.toLowerCase().replace(/\s+/g, '');
-              
-              // Check for duplicates (nom_canonique, ville, aliases)
-              const { data: existingEtabs } = await supabase
-                .from('etablissements')
-                .select('*')
-                .eq('user_id', userId)
-                .is('deleted_at', null);
-              
-              const foundDuplicates = existingEtabs?.filter(e => {
-                const existingNomLower = (e.nom_canonique || e.nom).toLowerCase().replace(/\s+/g, '');
-                return existingNomLower === nomCanonique || 
-                       (args.ville && e.ville && e.ville.toLowerCase() === args.ville.toLowerCase() && 
-                        existingNomLower.includes(nomCanonique.substring(0, 5)));
-              }) || [];
-              
-              // Check aliases
-              if (foundDuplicates.length === 0) {
-                const { data: aliasMatches } = await supabase
-                  .from('etablissements_aliases')
-                  .select('etablissement_id')
-                  .ilike('alias', `%${args.nom}%`);
+              try {
+                // Normalize nom_canonique
+                const nomCanonique = args.nom.toLowerCase()
+                  .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // remove accents
+                  .replace(/\s+/g, '');
                 
-                if (aliasMatches && aliasMatches.length > 0) {
-                  const aliasEtabIds = aliasMatches.map(a => a.etablissement_id);
-                  const { data: aliasEtabs } = await supabase
-                    .from('etablissements')
-                    .select('*')
-                    .in('id', aliasEtabIds)
-                    .eq('user_id', userId)
-                    .is('deleted_at', null);
-                  
-                  if (aliasEtabs) foundDuplicates.push(...aliasEtabs);
+                // Auto-map type and statut_commercial if not provided
+                let finalType = args.type || 'prospect';
+                let finalStatut = args.statut_commercial;
+                
+                // Detect from nom if type not explicit
+                const nomLower = args.nom.toLowerCase();
+                if (!args.type) {
+                  if (nomLower.includes('client actuel')) {
+                    finalType = 'client';
+                    finalStatut = finalStatut || 'gagné';
+                  } else if (nomLower.includes('prospect')) {
+                    finalType = 'prospect';
+                    finalStatut = finalStatut || 'à_contacter';
+                  } else {
+                    finalType = 'prospect';
+                    finalStatut = finalStatut || 'à_contacter';
+                  }
+                } else {
+                  // Apply auto-mapping based on type
+                  if (finalType === 'client' && !finalStatut) {
+                    finalStatut = 'gagné';
+                  } else if (finalType === 'prospect' && !finalStatut) {
+                    finalStatut = 'à_contacter';
+                  }
                 }
-              }
-              
-              if (foundDuplicates.length > 0) {
+                
+                console.log(`Creating etablissement: ${args.nom}, type=${finalType}, statut_commercial=${finalStatut}`);
+                
+                // Check for duplicates (nom_canonique, ville, aliases)
+                const { data: existingEtabs } = await supabase
+                  .from('etablissements')
+                  .select('id, nom, nom_canonique, ville, created_at, updated_at')
+                  .eq('user_id', userId)
+                  .is('deleted_at', null);
+                
+                const foundDuplicates = existingEtabs?.filter(e => {
+                  const existingNomLower = (e.nom_canonique || e.nom).toLowerCase()
+                    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                    .replace(/\s+/g, '');
+                  return existingNomLower === nomCanonique || 
+                         (args.ville && e.ville && e.ville.toLowerCase() === args.ville.toLowerCase() && 
+                          existingNomLower.includes(nomCanonique.substring(0, 5)));
+                }) || [];
+                
+                // Check aliases
+                if (foundDuplicates.length === 0) {
+                  const { data: aliasMatches } = await supabase
+                    .from('etablissements_aliases')
+                    .select('etablissement_id')
+                    .ilike('alias', `%${args.nom}%`);
+                  
+                  if (aliasMatches && aliasMatches.length > 0) {
+                    const aliasEtabIds = aliasMatches.map(a => a.etablissement_id);
+                    const { data: aliasEtabs } = await supabase
+                      .from('etablissements')
+                      .select('id, nom, nom_canonique, ville, created_at, updated_at')
+                      .in('id', aliasEtabIds)
+                      .eq('user_id', userId)
+                      .is('deleted_at', null);
+                    
+                    if (aliasEtabs) foundDuplicates.push(...aliasEtabs);
+                  }
+                }
+                
+                // DEDUPLICATION SILENCIEUSE (auto-merge if high confidence, else ask)
+                if (foundDuplicates.length > 0) {
+                  console.log(`Duplicates detected for ${args.nom}:`, foundDuplicates);
+                  
+                  // If only 1 duplicate and high confidence match → auto-merge silently
+                  if (foundDuplicates.length === 1) {
+                    const duplicate = foundDuplicates[0];
+                    console.log(`Auto-merging into existing etablissement: ${duplicate.nom}`);
+                    
+                    // Update existing with new non-null fields
+                    const updateData: any = {};
+                    if (args.nom_affiche) updateData.nom_affiche = args.nom_affiche;
+                    if (args.adresse) updateData.adresse = args.adresse;
+                    if (args.code_postal) updateData.code_postal = args.code_postal;
+                    if (args.ville) updateData.ville = args.ville;
+                    if (args.secteur) updateData.secteur = args.secteur;
+                    if (args.sous_secteur) updateData.sous_secteur = args.sous_secteur;
+                    if (args.statut_commercial) updateData.statut_commercial = args.statut_commercial;
+                    if (args.concurrent_principal) updateData.concurrent_principal = args.concurrent_principal;
+                    if (args.coefficient) updateData.coefficient = args.coefficient;
+                    if (args.groupe) updateData.groupe = args.groupe;
+                    if (args.notes) updateData.notes = args.notes;
+                    if (args.info_libre) updateData.info_libre = args.info_libre;
+                    
+                    if (Object.keys(updateData).length > 0) {
+                      await supabase
+                        .from('etablissements')
+                        .update(updateData)
+                        .eq('id', duplicate.id);
+                    }
+                    
+                    // Log merge
+                    await supabase.from('historique').insert({
+                      action: 'auto_deduplicate',
+                      data: {
+                        table_cible: 'etablissements',
+                        existing_id: duplicate.id,
+                        attempted_nom: args.nom,
+                        action: 'updated_existing'
+                      },
+                      user_id: userId
+                    });
+                    
+                    result = { 
+                      success: true, 
+                      data: { id: duplicate.id, nom: duplicate.nom },
+                      message: `✓ Établissement "${args.nom}" identifié comme doublon de "${duplicate.nom}" et fusionné automatiquement.`
+                    };
+                    break;
+                  }
+                  
+                  // Multiple duplicates → ask for clarification
+                  result = { 
+                    success: false, 
+                    warning: 'duplicate_detected',
+                    data: foundDuplicates,
+                    message: `⚠️ ${foundDuplicates.length} établissement(s) similaire(s) détecté(s). Lequel garder comme maître ?`
+                  };
+                  break;
+                }
+
+                // No duplicates, create with minimal fields first, then update
+                const minimalData = {
+                  nom: args.nom,
+                  nom_canonique: nomCanonique,
+                  type: finalType,
+                  user_id: userId
+                };
+                
+                let etabData;
+                let etabError;
+                
+                // Try full insert first
+                try {
+                  const fullData = {
+                    ...minimalData,
+                    nom_affiche: args.nom_affiche,
+                    adresse: args.adresse,
+                    code_postal: args.code_postal,
+                    ville: args.ville,
+                    secteur: args.secteur,
+                    sous_secteur: args.sous_secteur,
+                    statut_commercial: finalStatut,
+                    concurrent_principal: args.concurrent_principal,
+                    coefficient: args.coefficient,
+                    groupe: args.groupe,
+                    notes: args.notes,
+                    info_libre: args.info_libre
+                  };
+                  
+                  const { data, error } = await supabase
+                    .from('etablissements')
+                    .insert(fullData)
+                    .select()
+                    .single();
+                  
+                  etabData = data;
+                  etabError = error;
+                } catch (fullError) {
+                  console.error('Full insert failed, retrying with minimal data:', fullError);
+                  etabError = fullError;
+                }
+                
+                // If full insert failed, retry with minimal data
+                if (etabError) {
+                  console.log('Retrying with minimal data:', minimalData);
+                  const { data, error } = await supabase
+                    .from('etablissements')
+                    .insert(minimalData)
+                    .select()
+                    .single();
+                  
+                  if (error) {
+                    console.error('Minimal insert also failed:', error);
+                    throw error;
+                  }
+                  
+                  etabData = data;
+                  
+                  // Now update with optional fields
+                  const updateData: any = {};
+                  if (args.nom_affiche) updateData.nom_affiche = args.nom_affiche;
+                  if (args.adresse) updateData.adresse = args.adresse;
+                  if (args.code_postal) updateData.code_postal = args.code_postal;
+                  if (args.ville) updateData.ville = args.ville;
+                  if (args.secteur) updateData.secteur = args.secteur;
+                  if (args.sous_secteur) updateData.sous_secteur = args.sous_secteur;
+                  if (finalStatut) updateData.statut_commercial = finalStatut;
+                  if (args.concurrent_principal) updateData.concurrent_principal = args.concurrent_principal;
+                  if (args.coefficient) updateData.coefficient = args.coefficient;
+                  if (args.groupe) updateData.groupe = args.groupe;
+                  if (args.notes) updateData.notes = args.notes;
+                  if (args.info_libre) updateData.info_libre = args.info_libre;
+                  
+                  if (Object.keys(updateData).length > 0) {
+                    const { data: updatedData } = await supabase
+                      .from('etablissements')
+                      .update(updateData)
+                      .eq('id', etabData.id)
+                      .select()
+                      .single();
+                    
+                    if (updatedData) etabData = updatedData;
+                  }
+                }
+                
+                console.log('Etablissement created successfully:', etabData);
+                result = { success: true, data: etabData };
+                
+              } catch (error) {
+                console.error('Error in create_etablissement:', error);
+                const errorMessage = error instanceof Error ? error.message : String(error);
                 result = { 
                   success: false, 
-                  warning: 'duplicate_detected',
-                  data: foundDuplicates,
-                  message: `⚠️ Doublon détecté: ${foundDuplicates.length} établissement(s) similaire(s). Fusionner ou annuler ?`
+                  error: `Erreur lors de la création: ${errorMessage}. Vérifiez les données et réessayez.`
                 };
-                break;
               }
-
-              // No duplicates, create with full fields
-              const { data: etabData, error: etabError } = await supabase
-                .from('etablissements')
-                .insert({
-                  nom: args.nom,
-                  nom_affiche: args.nom_affiche,
-                  nom_canonique: nomCanonique,
-                  adresse: args.adresse,
-                  code_postal: args.code_postal,
-                  ville: args.ville,
-                  type: args.type,
-                  secteur: args.secteur,
-                  sous_secteur: args.sous_secteur,
-                  statut_commercial: args.statut_commercial,
-                  concurrent_principal: args.concurrent_principal,
-                  coefficient: args.coefficient,
-                  groupe: args.groupe,
-                  notes: args.notes,
-                  info_libre: args.info_libre,
-                  user_id: userId
-                })
-                .select()
-                .single();
-              
-              if (etabError) throw etabError;
-              result = { success: true, data: etabData };
               break;
 
             case 'create_contact':
