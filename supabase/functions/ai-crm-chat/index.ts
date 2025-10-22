@@ -7,6 +7,162 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// ============= DATE PARSING FR =============
+// Parse French dates with Europe/Paris timezone
+function parseFrenchDate(dateStr: string, defaultHour = 9, defaultMinute = 0): Date | null {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+  
+  const now = new Date();
+  const parisOffset = 1; // Europe/Paris UTC+1 (simplification, ignore DST for now)
+  
+  const trimmed = dateStr.trim().toLowerCase();
+  
+  // Relative dates
+  if (trimmed === 'demain' || trimmed === 'tomorrow') {
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(defaultHour, defaultMinute, 0, 0);
+    return tomorrow;
+  }
+  
+  if (trimmed === 'après-demain' || trimmed === 'apres-demain') {
+    const afterTomorrow = new Date(now);
+    afterTomorrow.setDate(afterTomorrow.getDate() + 2);
+    afterTomorrow.setHours(defaultHour, defaultMinute, 0, 0);
+    return afterTomorrow;
+  }
+  
+  // "dans X jours/semaines"
+  const inDaysMatch = trimmed.match(/dans\s+(\d+)\s+jours?/);
+  if (inDaysMatch) {
+    const days = parseInt(inDaysMatch[1]);
+    const future = new Date(now);
+    future.setDate(future.getDate() + days);
+    future.setHours(defaultHour, defaultMinute, 0, 0);
+    return future;
+  }
+  
+  const inWeeksMatch = trimmed.match(/dans\s+(\d+)\s+semaines?/);
+  if (inWeeksMatch) {
+    const weeks = parseInt(inWeeksMatch[1]);
+    const future = new Date(now);
+    future.setDate(future.getDate() + (weeks * 7));
+    future.setHours(defaultHour, defaultMinute, 0, 0);
+    return future;
+  }
+  
+  // "la semaine prochaine"
+  if (trimmed.includes('semaine prochaine')) {
+    const nextWeek = new Date(now);
+    nextWeek.setDate(nextWeek.getDate() + 7);
+    nextWeek.setHours(defaultHour, defaultMinute, 0, 0);
+    return nextWeek;
+  }
+  
+  // Days of week
+  const daysOfWeek = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+  for (let i = 0; i < daysOfWeek.length; i++) {
+    if (trimmed.startsWith(daysOfWeek[i])) {
+      const targetDay = i;
+      const currentDay = now.getDay();
+      let daysToAdd = targetDay - currentDay;
+      if (daysToAdd <= 0) daysToAdd += 7; // Next occurrence
+      
+      const targetDate = new Date(now);
+      targetDate.setDate(targetDate.getDate() + daysToAdd);
+      
+      // Check for hour in string (e.g., "lundi 15h" or "lundi 15:30")
+      const hourMatch = trimmed.match(/(\d{1,2})[:h](\d{2})?/);
+      if (hourMatch) {
+        const hour = parseInt(hourMatch[1]);
+        const minute = hourMatch[2] ? parseInt(hourMatch[2]) : 0;
+        targetDate.setHours(hour, minute, 0, 0);
+      } else {
+        targetDate.setHours(defaultHour, defaultMinute, 0, 0);
+      }
+      
+      return targetDate;
+    }
+  }
+  
+  // Extract hour if present
+  let hour = defaultHour;
+  let minute = defaultMinute;
+  const hourMatch = dateStr.match(/(\d{1,2})[:h](\d{2})?/);
+  if (hourMatch) {
+    hour = parseInt(hourMatch[1]);
+    minute = hourMatch[2] ? parseInt(hourMatch[2]) : 0;
+  }
+  
+  // French month names
+  const monthsFr = {
+    'janvier': 0, 'jan': 0,
+    'février': 1, 'fev': 1, 'fevrier': 1, 'feb': 1,
+    'mars': 2, 'mar': 2,
+    'avril': 3, 'avr': 3, 'apr': 3,
+    'mai': 4, 'may': 4,
+    'juin': 5, 'jun': 5,
+    'juillet': 6, 'juil': 6, 'jul': 6,
+    'août': 7, 'aout': 7, 'aug': 7,
+    'septembre': 8, 'sept': 8, 'sep': 8,
+    'octobre': 9, 'oct': 9,
+    'novembre': 10, 'nov': 10,
+    'décembre': 11, 'dec': 11, 'decembre': 11
+  };
+  
+  // "11 novembre", "11 novembre 2025", "11 nov"
+  for (const [monthName, monthIndex] of Object.entries(monthsFr)) {
+    const regex = new RegExp(`(\\d{1,2})\\s+${monthName}(?:\\s+(\\d{4}))?`, 'i');
+    const match = dateStr.match(regex);
+    if (match) {
+      const day = parseInt(match[1]);
+      const year = match[2] ? parseInt(match[2]) : now.getFullYear();
+      const date = new Date(year, monthIndex, day, hour, minute, 0, 0);
+      
+      // If date is in the past this year and no year specified, use next year
+      if (!match[2] && date < now) {
+        date.setFullYear(date.getFullYear() + 1);
+      }
+      
+      return date;
+    }
+  }
+  
+  // Numeric formats: "11/11", "11/11/25", "11-11-2025", "11/11/2025"
+  const numericMatch = dateStr.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
+  if (numericMatch) {
+    const day = parseInt(numericMatch[1]);
+    const month = parseInt(numericMatch[2]) - 1; // 0-indexed
+    let year = now.getFullYear();
+    
+    if (numericMatch[3]) {
+      year = parseInt(numericMatch[3]);
+      if (year < 100) year += 2000; // 25 -> 2025
+    }
+    
+    const date = new Date(year, month, day, hour, minute, 0, 0);
+    
+    // If date is in the past this year and no year specified, use next year
+    if (!numericMatch[3] && date < now) {
+      date.setFullYear(date.getFullYear() + 1);
+    }
+    
+    return date;
+  }
+  
+  // Try ISO format as fallback
+  try {
+    const isoDate = new Date(dateStr);
+    if (!isNaN(isoDate.getTime())) {
+      return isoDate;
+    }
+  } catch (e) {
+    // Ignore
+  }
+  
+  return null;
+}
+
 // System prompt for the AI assistant
 const SYSTEM_PROMPT = `Tu es l'assistant IA du CRM ADAPTEL Lyon (agence de travail temporaire spécialisée en Hôtellerie/Restauration).
 
@@ -41,6 +197,19 @@ DÉDUPLICATION SILENCIEUSE (par défaut) :
 NOM CANONIQUE & ALIASES :
 - Calcule automatiquement nom_canonique (minuscule, sans accents, sans espaces)
 - Si variante de nom détectée → crée etablissements_aliases SANS demander
+
+DATES FRANÇAISES (parsing robuste) :
+- Formats naturels : "11 novembre", "11 nov", "11 novembre 2025"
+- Formats numériques : "11/11", "11/11/25", "11-11-2025", "11/11/2025"
+- Relatifs : "demain", "après-demain", "lundi", "lundi 15h", "dans 2 jours", "dans 3 semaines", "la semaine prochaine"
+- Heure optionnelle : si présente (15h, 15:30) l'utiliser, sinon défaut 09:00
+- Année manquante : interpréter dans l'année courante ; si déjà passée cette année → année +1
+- Fuseau : Europe/Paris (toujours)
+- Pour "Rappel {date} : {objet} pour {Établissement}" :
+  * Fuzzy-match établissement (nom canonique/alias/ville)
+  * Si aucun match → création minimale automatique (nom + type='prospect' + user_id)
+  * Puis créer l'action avec rappel_le
+- Si date ambiguë/invalide → message court "Date ambiguë : précise le jour/mois/année ou une heure" SANS bloquer le reste
 
 CONCURRENCE : postes[], secteur, coefficient_observe, statut (actif/historique/pressenti)
 RAPPELS : rappel_le automatique (RDV: 1h avant, tâche: jour J 9h)
@@ -661,79 +830,165 @@ serve(async (req) => {
               break;
 
             case 'create_action':
-              const { data: etabForAction } = await supabase
-                .from('etablissements')
-                .select('id')
-                .eq('nom', args.etablissement_nom)
-                .eq('user_id', userId)
-                .single();
-              
-              if (!etabForAction) {
-                result = { success: false, error: 'Établissement non trouvé' };
-                break;
-              }
-
-              // Find contact if provided
-              let contactId = null;
-              if (args.contact_nom) {
-                const { data: contactForAction } = await supabase
-                  .from('contacts')
-                  .select('id')
-                  .eq('etablissement_id', etabForAction.id)
-                  .ilike('nom', `%${args.contact_nom}%`)
+              try {
+                // Try to find etablissement first
+                let etabForAction = null;
+                const { data: foundEtab } = await supabase
+                  .from('etablissements')
+                  .select('id, nom')
+                  .eq('user_id', userId)
+                  .is('deleted_at', null)
+                  .or(`nom.ilike.%${args.etablissement_nom}%,nom_canonique.ilike.%${args.etablissement_nom.toLowerCase().replace(/\s+/g, '')}%`)
                   .limit(1)
                   .single();
                 
-                if (contactForAction) contactId = contactForAction.id;
-              }
-
-              // Handle assigne_a if provided
-              let assigneAId = null;
-              if (args.assigne_a_name) {
-                const { data: internalUser } = await supabase
-                  .from('utilisateurs_internes')
-                  .select('user_id')
-                  .ilike('prenom', args.assigne_a_name)
-                  .limit(1)
-                  .single();
-                
-                if (internalUser) assigneAId = internalUser.user_id;
-              }
-
-              // Auto-set rappel_le if not provided
-              let rappelLe = args.rappel_le;
-              if (!rappelLe && (args.type === 'rdv' || args.type === 'tache')) {
-                const actionDate = new Date(args.date);
-                if (args.type === 'rdv') {
-                  // 1h before
-                  rappelLe = new Date(actionDate.getTime() - 60 * 60 * 1000).toISOString();
+                if (foundEtab) {
+                  etabForAction = foundEtab;
                 } else {
-                  // Same day at 9am
-                  const rappelDate = new Date(actionDate);
-                  rappelDate.setHours(9, 0, 0, 0);
-                  rappelLe = rappelDate.toISOString();
+                  // Fuzzy match with aliases
+                  const { data: aliasMatches } = await supabase
+                    .from('etablissements_aliases')
+                    .select('etablissement_id')
+                    .ilike('alias', `%${args.etablissement_nom}%`)
+                    .limit(1);
+                  
+                  if (aliasMatches && aliasMatches.length > 0) {
+                    const { data: etabFromAlias } = await supabase
+                      .from('etablissements')
+                      .select('id, nom')
+                      .eq('id', aliasMatches[0].etablissement_id)
+                      .eq('user_id', userId)
+                      .is('deleted_at', null)
+                      .single();
+                    
+                    if (etabFromAlias) {
+                      etabForAction = etabFromAlias;
+                    }
+                  }
                 }
-              }
+                
+                // If still not found, create minimal etablissement
+                if (!etabForAction) {
+                  console.log(`Établissement "${args.etablissement_nom}" non trouvé, création minimale automatique`);
+                  const nomCanonique = args.etablissement_nom.toLowerCase()
+                    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                    .replace(/\s+/g, '');
+                  
+                  const { data: newEtab, error: createError } = await supabase
+                    .from('etablissements')
+                    .insert({
+                      nom: args.etablissement_nom,
+                      nom_canonique: nomCanonique,
+                      type: 'prospect',
+                      statut_commercial: 'à_contacter',
+                      user_id: userId
+                    })
+                    .select('id, nom')
+                    .single();
+                  
+                  if (createError) {
+                    console.error('Error creating minimal etablissement:', createError);
+                    result = { success: false, error: `Établissement "${args.etablissement_nom}" non trouvé et création impossible: ${createError.message}` };
+                    break;
+                  }
+                  
+                  etabForAction = newEtab;
+                  console.log('Établissement créé automatiquement:', newEtab);
+                }
 
-              const { data: actionData, error: actionError } = await supabase
-                .from('actions')
-                .insert({
-                  type: args.type,
-                  date: args.date,
-                  rappel_le: rappelLe,
-                  commentaire: args.commentaire,
-                  resultat: args.resultat,
-                  contact_id: contactId,
-                  assigne_a: assigneAId,
-                  info_libre: args.info_libre,
-                  etablissement_id: etabForAction.id,
-                  user_id: userId
-                })
-                .select()
-                .single();
-              
-              if (actionError) throw actionError;
-              result = { success: true, data: actionData };
+                // Find contact if provided
+                let contactId = null;
+                if (args.contact_nom) {
+                  const { data: contactForAction } = await supabase
+                    .from('contacts')
+                    .select('id')
+                    .eq('etablissement_id', etabForAction.id)
+                    .ilike('nom', `%${args.contact_nom}%`)
+                    .limit(1)
+                    .single();
+                  
+                  if (contactForAction) contactId = contactForAction.id;
+                }
+
+                // Handle assigne_a if provided
+                let assigneAId = null;
+                if (args.assigne_a_name) {
+                  const { data: internalUser } = await supabase
+                    .from('utilisateurs_internes')
+                    .select('user_id')
+                    .ilike('prenom', args.assigne_a_name)
+                    .limit(1)
+                    .single();
+                  
+                  if (internalUser) assigneAId = internalUser.user_id;
+                }
+
+                // Parse dates with French date parser
+                let actionDate: Date | null = null;
+                let rappelLe: string | null = null;
+                
+                // Parse action date
+                if (args.date) {
+                  actionDate = parseFrenchDate(args.date);
+                  if (!actionDate) {
+                    console.warn(`Date "${args.date}" invalide ou ambiguë`);
+                    result = { 
+                      success: false, 
+                      error: `Date ambiguë : précise le jour/mois/année ou une heure pour "${args.date}"` 
+                    };
+                    break;
+                  }
+                }
+                
+                // Parse rappel_le if provided, otherwise auto-set
+                if (args.rappel_le) {
+                  rappelLe = parseFrenchDate(args.rappel_le)?.toISOString() || null;
+                  if (!rappelLe) {
+                    console.warn(`Rappel date "${args.rappel_le}" invalide, ignoré`);
+                  }
+                } else if (actionDate && (args.type === 'rdv' || args.type === 'tache')) {
+                  // Auto-set rappel_le
+                  if (args.type === 'rdv') {
+                    // 1h before
+                    rappelLe = new Date(actionDate.getTime() - 60 * 60 * 1000).toISOString();
+                  } else {
+                    // Same day at 9am
+                    const rappelDate = new Date(actionDate);
+                    rappelDate.setHours(9, 0, 0, 0);
+                    rappelLe = rappelDate.toISOString();
+                  }
+                }
+
+                const { data: actionData, error: actionError } = await supabase
+                  .from('actions')
+                  .insert({
+                    type: args.type,
+                    date: actionDate ? actionDate.toISOString() : new Date().toISOString(),
+                    rappel_le: rappelLe,
+                    commentaire: args.commentaire,
+                    resultat: args.resultat,
+                    contact_id: contactId,
+                    assigne_a: assigneAId,
+                    info_libre: args.info_libre,
+                    etablissement_id: etabForAction.id,
+                    user_id: userId
+                  })
+                  .select()
+                  .single();
+                
+                if (actionError) {
+                  console.error('Error executing create_action:', actionError);
+                  throw actionError;
+                }
+                result = { success: true, data: actionData };
+              } catch (error) {
+                console.error('Error in create_action:', error);
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                result = { 
+                  success: false, 
+                  error: `Erreur lors de la création de l'action: ${errorMessage}`
+                };
+              }
               break;
 
             case 'search_etablissements':
