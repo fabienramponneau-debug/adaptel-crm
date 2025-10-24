@@ -166,7 +166,14 @@ function parseFrenchDate(dateStr: string, defaultHour = 9, defaultMinute = 0): D
 // System prompt for the AI assistant
 const SYSTEM_PROMPT = `Tu es l'assistant IA du CRM ADAPTEL Lyon (agence de travail temporaire spécialisée en Hôtellerie/Restauration).
 
+GARDE-FOU INTERNE :
+- JAMAIS créer d'établissement pour notre propre société ADAPTEL (tolérer accents/casse)
+- Si détecté "ADAPTEL", "ADAPTEL Lyon", "ADAPTEL Intérim", etc. → répondre : "C'est notre société, je n'enregistre pas d'établissement pour nous."
+
 CRÉATION TOLÉRANTE (JAMAIS BLOQUER) :
+- AVANT création : lookup doublon par nom_canonique/ville/alias pour le même user_id
+- Si trouvé → UPDATE au lieu de créer une nouvelle fiche
+- Si nouveau statut "client actuel" et existant "prospect" → PROMOTION : type='client', statut_commercial='gagné', log promotion
 - Toujours créer avec socle minimal : nom + user_id + type
 - Mapping automatique du type depuis la phrase utilisateur :
   * "client actuel" → type='client', statut_commercial='gagné'
@@ -208,18 +215,25 @@ DATES FRANÇAISES (parsing robuste) :
 - Fuseau : Europe/Paris (toujours)
 - Si date ambiguë/invalide → message court "Date ambiguë : précise le jour/mois/année ou une heure" SANS bloquer le reste
 
-RAPPELS (création fiable - CRITIQUE) :
+RAPPELS (création fiable - CRITIQUE - 100% réussite) :
 - Pour "rappelle-moi..." / "enregistre un rappel {date} ... {Établissement}" :
   * Fuzzy-match établissement (nom canonique/alias/ville)
-  * Si aucun match → création minimale automatique (nom + type='prospect' + user_id)
+  * Si aucun match → création minimale automatique (nom + type='prospect' + user_id), log { created_establishment_id, nom }
   * Type action : 'rappel' (ou 'appel' si le texte le suggère)
   * OBLIGATOIRE : remplir date ET rappel_le avec la MÊME valeur datetime normalisée
+  * Toujours user_id = auth.uid()
   * Ne jamais bloquer si ville/coef/groupe manquent
-  * Log avant insert : { etablissement_id, date, rappel_le, type }
+  * Log avant insert : { user_id, etablissement_id, date, rappel_le, type }
+  * Si échec NOT NULL / RLS / FK → retry : recréer établissement minimal + insert action immédiatement
 
 CONCURRENCE :
 - postes[], secteur (hérité de l'établissement si absent), coefficient_observe, statut (actif/historique/pressenti)
 - Requête "Quel concurrent le plus présent sur {secteur}" → agréger par concurrent_principal, Top 3 (avec compte)
+- Requête "Quels concurrents en base" → liste distincte concurrent_principal avec compte associé (Top 10)
+
+RAPPELS & ACTIONS (requêtes) :
+- "Quels rappels pour moi ?" / "Rappels de la semaine" → actions type IN ('rappel','appel'), rappel_le dans période, user_id=auth.uid()
+- "Quelles actions commerciales en cours ?" → actions date >= now() - 30 jours, user_id=auth.uid(), hors soft-deleted
 
 ASSIGNATIONS : "Dis à Céline..." → assigne_a
 SUPPRESSION : toujours soft delete (deleted_at)
@@ -477,13 +491,42 @@ const tools = [
     type: "function",
     function: {
       name: "query_concurrence",
-      description: "Interroger la concurrence (concurrent le plus présent, coef moyen, etc.)",
+      description: "Interroger la concurrence (concurrent le plus présent, coef moyen, etc.). Retourne aussi liste distincte des concurrents avec compte.",
       parameters: {
         type: "object",
         properties: {
           concurrent: { type: "string", description: "Nom du concurrent à analyser" },
           poste: { type: "string", description: "Poste à filtrer" },
-          secteur: { type: "string", description: "Secteur à filtrer" }
+          secteur: { type: "string", description: "Secteur à filtrer" },
+          list_all: { type: "boolean", description: "Si true, liste tous les concurrents distincts avec compte (Top 10)" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_rappels",
+      description: "Rechercher les rappels (actions type='rappel' ou 'appel') pour l'utilisateur courant, avec filtrage par période",
+      parameters: {
+        type: "object",
+        properties: {
+          date_debut: { type: "string", description: "Date de début au format ISO 8601" },
+          date_fin: { type: "string", description: "Date de fin au format ISO 8601" },
+          periode: { type: "string", enum: ["semaine", "mois", "today"], description: "Période prédéfinie: 'semaine' (7j), 'mois' (30j), 'today' (aujourd'hui)" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_actions_en_cours",
+      description: "Rechercher les actions commerciales en cours (30 derniers jours) pour l'utilisateur courant",
+      parameters: {
+        type: "object",
+        properties: {
+          days: { type: "number", description: "Nombre de jours dans le passé (défaut: 30)" }
         }
       }
     }
@@ -574,6 +617,17 @@ serve(async (req) => {
           switch (functionName) {
             case 'create_etablissement':
               try {
+                // GARDE-FOU INTERNE : Blacklist ADAPTEL
+                const nomLowerAdaptel = args.nom.toLowerCase()
+                  .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+                if (nomLowerAdaptel.includes('adaptel')) {
+                  result = { 
+                    success: false, 
+                    error: "C'est notre société, je n'enregistre pas d'établissement pour nous." 
+                  };
+                  break;
+                }
+                
                 // Normalize nom_canonique
                 const nomCanonique = args.nom.toLowerCase()
                   .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // remove accents
@@ -610,7 +664,7 @@ serve(async (req) => {
                 // Check for duplicates (nom_canonique, ville, aliases)
                 const { data: existingEtabs } = await supabase
                   .from('etablissements')
-                  .select('id, nom, nom_canonique, ville, created_at, updated_at')
+                  .select('id, nom, nom_canonique, ville, type, created_at, updated_at')
                   .eq('user_id', userId)
                   .is('deleted_at', null);
                 
@@ -634,7 +688,7 @@ serve(async (req) => {
                     const aliasEtabIds = aliasMatches.map(a => a.etablissement_id);
                     const { data: aliasEtabs } = await supabase
                       .from('etablissements')
-                      .select('id, nom, nom_canonique, ville, created_at, updated_at')
+                      .select('id, nom, nom_canonique, ville, type, created_at, updated_at')
                       .in('id', aliasEtabIds)
                       .eq('user_id', userId)
                       .is('deleted_at', null);
@@ -647,20 +701,31 @@ serve(async (req) => {
                 if (foundDuplicates.length > 0) {
                   console.log(`Duplicates detected for ${args.nom}:`, foundDuplicates);
                   
-                  // If only 1 duplicate and high confidence match → auto-merge silently
+                  // If only 1 duplicate and high confidence match → UPDATE existing instead of creating
                   if (foundDuplicates.length === 1) {
                     const duplicate = foundDuplicates[0];
                     console.log(`Auto-merging into existing etablissement: ${duplicate.nom}`);
                     
-                    // Update existing with new non-null fields
+                    // PROMOTION prospect→client si demandé
+                    let promotionApplied = false;
+                    if (finalType === 'client' && duplicate.type === 'prospect') {
+                      console.log({ establishment_id: duplicate.id, promotion: true });
+                      promotionApplied = true;
+                    }
+                    
+                    // Update existing with new non-null fields + promotion si applicable
                     const updateData: any = {};
+                    if (promotionApplied) {
+                      updateData.type = 'client';
+                      updateData.statut_commercial = 'gagné';
+                    }
                     if (args.nom_affiche) updateData.nom_affiche = args.nom_affiche;
                     if (args.adresse) updateData.adresse = args.adresse;
                     if (args.code_postal) updateData.code_postal = args.code_postal;
                     if (args.ville) updateData.ville = args.ville;
                     if (args.secteur) updateData.secteur = args.secteur;
                     if (args.sous_secteur) updateData.sous_secteur = args.sous_secteur;
-                    if (args.statut_commercial) updateData.statut_commercial = args.statut_commercial;
+                    if (args.statut_commercial && !promotionApplied) updateData.statut_commercial = args.statut_commercial;
                     if (args.concurrent_principal) updateData.concurrent_principal = args.concurrent_principal;
                     if (args.coefficient) updateData.coefficient = args.coefficient;
                     if (args.groupe) updateData.groupe = args.groupe;
@@ -686,10 +751,14 @@ serve(async (req) => {
                       user_id: userId
                     });
                     
+                    const message = promotionApplied 
+                      ? `✓ Établissement "${args.nom}" promu de prospect à client et fusionné avec "${duplicate.nom}".`
+                      : `✓ Établissement "${args.nom}" identifié comme doublon de "${duplicate.nom}" et fusionné automatiquement.`;
+                    
                     result = { 
                       success: true, 
                       data: { id: duplicate.id, nom: duplicate.nom },
-                      message: `✓ Établissement "${args.nom}" identifié comme doublon de "${duplicate.nom}" et fusionné automatiquement.`
+                      message
                     };
                     break;
                   }
@@ -901,7 +970,7 @@ serve(async (req) => {
                   }
                   
                   etabForAction = newEtab;
-                  console.log('Établissement créé automatiquement:', newEtab);
+                  console.log({ created_establishment_id: newEtab.id, nom: newEtab.nom });
                 }
 
                 // Find contact if provided (nullable)
@@ -967,34 +1036,95 @@ serve(async (req) => {
                 
                 // Log before insert (debug)
                 console.log('Inserting action:', {
+                  user_id: userId,
                   etablissement_id: etabForAction.id,
                   type: args.type,
                   date: finalDate,
-                  rappel_le: rappelLe,
-                  commentaire: args.commentaire
+                  rappel_le: rappelLe
                 });
 
-                const { data: actionData, error: actionError } = await supabase
-                  .from('actions')
-                  .insert({
-                    type: args.type,
-                    date: finalDate,
-                    rappel_le: rappelLe,
-                    commentaire: args.commentaire,
-                    resultat: args.resultat,
-                    contact_id: contactId,
-                    assigne_a: assigneAId,
-                    info_libre: args.info_libre,
-                    etablissement_id: etabForAction.id,
-                    user_id: userId
-                  })
-                  .select()
-                  .single();
+                let actionData = null;
+                let actionError = null;
                 
-                if (actionError) {
-                  console.error('Error executing create_action:', actionError);
-                  throw actionError;
+                // Try insert with full data
+                try {
+                  const { data, error } = await supabase
+                    .from('actions')
+                    .insert({
+                      type: args.type,
+                      date: finalDate,
+                      rappel_le: rappelLe,
+                      commentaire: args.commentaire,
+                      resultat: args.resultat,
+                      contact_id: contactId,
+                      assigne_a: assigneAId,
+                      info_libre: args.info_libre,
+                      etablissement_id: etabForAction.id,
+                      user_id: userId
+                    })
+                    .select()
+                    .single();
+                  
+                  actionData = data;
+                  actionError = error;
+                } catch (insertError) {
+                  console.error('Insert action failed:', insertError);
+                  actionError = insertError;
                 }
+                
+                // RETRY: Si échec NOT NULL / RLS / FK → recréer établissement minimal + retry insert
+                if (actionError) {
+                  console.error('Error executing create_action, retrying with minimal etablissement:', actionError);
+                  
+                  // Recréer établissement minimal (au cas où il aurait été supprimé)
+                  const nomCanoniqueRetry = args.etablissement_nom.toLowerCase()
+                    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                    .replace(/\s+/g, '');
+                  
+                  const { data: retryEtab } = await supabase
+                    .from('etablissements')
+                    .insert({
+                      nom: args.etablissement_nom,
+                      nom_canonique: nomCanoniqueRetry,
+                      type: 'prospect',
+                      statut_commercial: 'à_contacter',
+                      user_id: userId
+                    })
+                    .select('id, nom')
+                    .single();
+                  
+                  if (retryEtab) {
+                    console.log({ created_establishment_id: retryEtab.id, nom: retryEtab.nom });
+                    
+                    // Retry insert action avec nouvel établissement
+                    const { data: retryActionData, error: retryActionError } = await supabase
+                      .from('actions')
+                      .insert({
+                        type: args.type,
+                        date: finalDate,
+                        rappel_le: rappelLe,
+                        commentaire: args.commentaire,
+                        resultat: args.resultat,
+                        contact_id: contactId,
+                        assigne_a: assigneAId,
+                        info_libre: args.info_libre,
+                        etablissement_id: retryEtab.id,
+                        user_id: userId
+                      })
+                      .select()
+                      .single();
+                    
+                    if (retryActionError) {
+                      console.error('Retry insert action also failed:', retryActionError);
+                      throw retryActionError;
+                    }
+                    
+                    actionData = retryActionData;
+                  } else {
+                    throw actionError;
+                  }
+                }
+                
                 result = { success: true, data: actionData };
               } catch (error) {
                 console.error('Error in create_action:', error);
@@ -1335,7 +1465,7 @@ serve(async (req) => {
                 );
               }
               
-              // Aggregate by concurrent_principal (Top 3)
+              // Aggregate by concurrent_principal (Top 3 ou Top 10 si list_all)
               type AggregatedConcurrent = { concurrent: string; count: number; coef_total: number };
               const aggregated = filteredResults.reduce((acc, curr) => {
                 const concurrent = curr.concurrent_principal || 'Inconnu';
@@ -1347,9 +1477,10 @@ serve(async (req) => {
                 return acc;
               }, {} as Record<string, AggregatedConcurrent>);
               
+              const topLimit = args.list_all ? 10 : 3;
               const topConcurrents = (Object.values(aggregated) as AggregatedConcurrent[])
                 .sort((a, b) => b.count - a.count)
-                .slice(0, 3)
+                .slice(0, topLimit)
                 .map(c => ({
                   concurrent: c.concurrent,
                   presence: c.count,
@@ -1366,6 +1497,79 @@ serve(async (req) => {
                     (filteredResults.reduce((acc, c) => acc + (c.coefficient_observe || 0), 0) / filteredResults.length).toFixed(3) : 
                     null
                 }
+              };
+              break;
+
+            case 'search_rappels':
+              let rappelQuery = supabase
+                .from('actions')
+                .select('*, etablissements(nom, ville)')
+                .eq('user_id', userId)
+                .in('type', ['rappel', 'appel'])
+                .is('deleted_at', null)
+                .order('rappel_le', { ascending: true });
+              
+              // Filtrage par période
+              if (args.date_debut) rappelQuery = rappelQuery.gte('rappel_le', args.date_debut);
+              if (args.date_fin) rappelQuery = rappelQuery.lte('rappel_le', args.date_fin);
+              
+              if (args.periode) {
+                const now = new Date();
+                let dateDebut: Date;
+                let dateFin: Date = new Date(now);
+                dateFin.setDate(dateFin.getDate() + 365); // fin lointaine
+                
+                switch (args.periode) {
+                  case 'today':
+                    dateDebut = new Date(now.setHours(0, 0, 0, 0));
+                    dateFin = new Date(now.setHours(23, 59, 59, 999));
+                    break;
+                  case 'semaine':
+                    dateDebut = new Date(now);
+                    dateFin.setDate(now.getDate() + 7);
+                    break;
+                  case 'mois':
+                    dateDebut = new Date(now);
+                    dateFin.setDate(now.getDate() + 30);
+                    break;
+                  default:
+                    dateDebut = new Date(now);
+                }
+                
+                rappelQuery = rappelQuery
+                  .gte('rappel_le', dateDebut.toISOString())
+                  .lte('rappel_le', dateFin.toISOString());
+              }
+              
+              const { data: rappels, error: rappelsError } = await rappelQuery;
+              if (rappelsError) throw rappelsError;
+              
+              result = { 
+                success: true, 
+                data: rappels,
+                message: `${rappels?.length || 0} rappel(s) trouvé(s)`
+              };
+              break;
+
+            case 'search_actions_en_cours':
+              const daysBack = args.days || 30;
+              const dateLimit = new Date();
+              dateLimit.setDate(dateLimit.getDate() - daysBack);
+              
+              const { data: actionsEnCours, error: actionsEnCoursError } = await supabase
+                .from('actions')
+                .select('*, etablissements(nom, ville)')
+                .eq('user_id', userId)
+                .is('deleted_at', null)
+                .gte('date', dateLimit.toISOString())
+                .order('date', { ascending: false });
+              
+              if (actionsEnCoursError) throw actionsEnCoursError;
+              
+              result = { 
+                success: true, 
+                data: actionsEnCours,
+                message: `${actionsEnCours?.length || 0} action(s) commerciale(s) en cours (${daysBack} derniers jours)`
               };
               break;
 
