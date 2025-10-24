@@ -179,12 +179,13 @@ CRÉATION TOLÉRANTE (JAMAIS BLOQUER) :
 MAPPING AUTOMATIQUE (zéro friction) :
 - "Client actuel Novotel Bron (Bron), coef 2.048, groupe ACCOR" → type='client', statut_commercial='gagné', ville='Bron', coefficient=2.048, groupe='ACCOR'
 - "Prospect Hôtel Y (Lyon) — cherche cuisiniers" → type='prospect', statut_commercial='à_contacter', ville='Lyon', info_libre={postes:['cuisine']}
-- "RDV demain 15h" → action + rappel_le automatique (1h avant si RDV, jour J 9h si tâche)
+- "RDV demain 15h" → action type='rdv' + rappel_le automatique (1h avant)
 - "Dis à Céline d'appeler..." → assigne_a (via utilisateurs_internes)
 - Tout hors schéma → info_libre jsonb
 
 SECTEURS : hôtellerie, restauration, hôtellerie-restauration, restauration_collective
 SOUS-SECTEURS : hôtel_1..5_étoiles, EHPAD, crèche, scolaire, résidence_hôtelière, etc.
+NORMALISATION SECTEUR : "hôtellerie restauration", "hôtellerie-restauration", "HR" → traiter comme 'hôtellerie' ET 'restauration'
 
 DÉDUPLICATION SILENCIEUSE (par défaut) :
 - Vérifier nom_canonique + ville + aliases avant création
@@ -205,14 +206,21 @@ DATES FRANÇAISES (parsing robuste) :
 - Heure optionnelle : si présente (15h, 15:30) l'utiliser, sinon défaut 09:00
 - Année manquante : interpréter dans l'année courante ; si déjà passée cette année → année +1
 - Fuseau : Europe/Paris (toujours)
-- Pour "Rappel {date} : {objet} pour {Établissement}" :
-  * Fuzzy-match établissement (nom canonique/alias/ville)
-  * Si aucun match → création minimale automatique (nom + type='prospect' + user_id)
-  * Puis créer l'action avec rappel_le
 - Si date ambiguë/invalide → message court "Date ambiguë : précise le jour/mois/année ou une heure" SANS bloquer le reste
 
-CONCURRENCE : postes[], secteur, coefficient_observe, statut (actif/historique/pressenti)
-RAPPELS : rappel_le automatique (RDV: 1h avant, tâche: jour J 9h)
+RAPPELS (création fiable - CRITIQUE) :
+- Pour "rappelle-moi..." / "enregistre un rappel {date} ... {Établissement}" :
+  * Fuzzy-match établissement (nom canonique/alias/ville)
+  * Si aucun match → création minimale automatique (nom + type='prospect' + user_id)
+  * Type action : 'rappel' (ou 'appel' si le texte le suggère)
+  * OBLIGATOIRE : remplir date ET rappel_le avec la MÊME valeur datetime normalisée
+  * Ne jamais bloquer si ville/coef/groupe manquent
+  * Log avant insert : { etablissement_id, date, rappel_le, type }
+
+CONCURRENCE :
+- postes[], secteur (hérité de l'établissement si absent), coefficient_observe, statut (actif/historique/pressenti)
+- Requête "Quel concurrent le plus présent sur {secteur}" → agréger par concurrent_principal, Top 3 (avec compte)
+
 ASSIGNATIONS : "Dis à Céline..." → assigne_a
 SUPPRESSION : toujours soft delete (deleted_at)
 
@@ -277,27 +285,27 @@ const tools = [
   {
     type: "function",
     function: {
-      name: "create_action",
-      description: "Créer une action commerciale ou un rappel (avec rappel_le auto si RDV/tâche)",
-      parameters: {
-        type: "object",
-        properties: {
-          etablissement_nom: { type: "string", description: "Nom de l'établissement" },
-          contact_nom: { type: "string", description: "Nom du contact lié (optionnel)" },
-          type: { 
-            type: "string", 
-            enum: ["appel", "visite", "mail", "rdv", "tache", "autre"],
-            description: "Type d'action"
-          },
-          date: { type: "string", description: "Date de l'action au format ISO 8601" },
-          rappel_le: { type: "string", description: "Date du rappel (auto: RDV=1h avant, tâche=jour J 9h)" },
-          commentaire: { type: "string", description: "Commentaire sur l'action" },
-          resultat: { type: "string", description: "Résultat de l'action" },
-          assigne_a_name: { type: "string", description: "Prénom du collaborateur à qui assigner (optionnel)" },
-          info_libre: { type: "object", description: "Données hors schéma (jsonb)" }
-        },
-        required: ["etablissement_nom", "type", "date"]
-      }
+          name: "create_action",
+          description: "Créer une action commerciale ou un rappel. Pour rappels: type='rappel' ou 'appel', date ET rappel_le doivent être identiques",
+          parameters: {
+            type: "object",
+            properties: {
+              etablissement_nom: { type: "string", description: "Nom de l'établissement" },
+              contact_nom: { type: "string", description: "Nom du contact lié (optionnel)" },
+              type: { 
+                type: "string", 
+                enum: ["appel", "visite", "mail", "rdv", "rappel", "autre"],
+                description: "Type d'action: 'rappel' ou 'appel' pour rappels, 'rdv' pour rendez-vous, etc."
+              },
+              date: { type: "string", description: "Date de l'action au format ISO 8601 ou FR (OBLIGATOIRE)" },
+              rappel_le: { type: "string", description: "Date du rappel (pour rappels: MÊME valeur que date; pour RDV: auto 1h avant)" },
+              commentaire: { type: "string", description: "Commentaire sur l'action" },
+              resultat: { type: "string", description: "Résultat de l'action" },
+              assigne_a_name: { type: "string", description: "Prénom du collaborateur à qui assigner (optionnel)" },
+              info_libre: { type: "object", description: "Données hors schéma (jsonb)" }
+            },
+            required: ["etablissement_nom", "type", "date"]
+          }
     }
   },
   {
@@ -831,7 +839,7 @@ serve(async (req) => {
 
             case 'create_action':
               try {
-                // Try to find etablissement first
+                // Try to find etablissement first (fuzzy-match: nom/nom_canonique/alias/ville)
                 let etabForAction = null;
                 const { data: foundEtab } = await supabase
                   .from('etablissements')
@@ -867,7 +875,7 @@ serve(async (req) => {
                   }
                 }
                 
-                // If still not found, create minimal etablissement
+                // If still not found, create minimal etablissement automatically
                 if (!etabForAction) {
                   console.log(`Établissement "${args.etablissement_nom}" non trouvé, création minimale automatique`);
                   const nomCanonique = args.etablissement_nom.toLowerCase()
@@ -896,7 +904,7 @@ serve(async (req) => {
                   console.log('Établissement créé automatiquement:', newEtab);
                 }
 
-                // Find contact if provided
+                // Find contact if provided (nullable)
                 let contactId = null;
                 if (args.contact_nom) {
                   const { data: contactForAction } = await supabase
@@ -923,11 +931,11 @@ serve(async (req) => {
                   if (internalUser) assigneAId = internalUser.user_id;
                 }
 
-                // Parse dates with French date parser
+                // Parse dates with French date parser (OBLIGATOIRE)
                 let actionDate: Date | null = null;
                 let rappelLe: string | null = null;
                 
-                // Parse action date
+                // Parse action date (MUST be provided)
                 if (args.date) {
                   actionDate = parseFrenchDate(args.date);
                   if (!actionDate) {
@@ -940,30 +948,37 @@ serve(async (req) => {
                   }
                 }
                 
-                // Parse rappel_le if provided, otherwise auto-set
-                if (args.rappel_le) {
+                // CRITIQUE: Pour rappels, date ET rappel_le doivent être identiques
+                if (args.type === 'rappel' || args.type === 'appel') {
+                  rappelLe = actionDate ? actionDate.toISOString() : new Date().toISOString();
+                } else if (args.rappel_le) {
+                  // Parse explicit rappel_le
                   rappelLe = parseFrenchDate(args.rappel_le)?.toISOString() || null;
                   if (!rappelLe) {
                     console.warn(`Rappel date "${args.rappel_le}" invalide, ignoré`);
                   }
-                } else if (actionDate && (args.type === 'rdv' || args.type === 'tache')) {
-                  // Auto-set rappel_le
-                  if (args.type === 'rdv') {
-                    // 1h before
-                    rappelLe = new Date(actionDate.getTime() - 60 * 60 * 1000).toISOString();
-                  } else {
-                    // Same day at 9am
-                    const rappelDate = new Date(actionDate);
-                    rappelDate.setHours(9, 0, 0, 0);
-                    rappelLe = rappelDate.toISOString();
-                  }
+                } else if (actionDate && args.type === 'rdv') {
+                  // Auto-set rappel_le for RDV: 1h before
+                  rappelLe = new Date(actionDate.getTime() - 60 * 60 * 1000).toISOString();
                 }
+
+                // Ensure date is always filled (NOT NULL)
+                const finalDate = actionDate ? actionDate.toISOString() : new Date().toISOString();
+                
+                // Log before insert (debug)
+                console.log('Inserting action:', {
+                  etablissement_id: etabForAction.id,
+                  type: args.type,
+                  date: finalDate,
+                  rappel_le: rappelLe,
+                  commentaire: args.commentaire
+                });
 
                 const { data: actionData, error: actionError } = await supabase
                   .from('actions')
                   .insert({
                     type: args.type,
-                    date: actionDate ? actionDate.toISOString() : new Date().toISOString(),
+                    date: finalDate,
                     rappel_le: rappelLe,
                     commentaire: args.commentaire,
                     resultat: args.resultat,
@@ -1250,7 +1265,7 @@ serve(async (req) => {
             case 'manage_concurrence':
               const { data: etabConcurrence } = await supabase
                 .from('etablissements')
-                .select('id')
+                .select('id, secteur')
                 .eq('nom', args.etablissement_nom)
                 .eq('user_id', userId)
                 .is('deleted_at', null)
@@ -1261,6 +1276,9 @@ serve(async (req) => {
                 break;
               }
 
+              // Si secteur absent, hériter du secteur de l'établissement
+              const finalSecteur = args.secteur || etabConcurrence.secteur || null;
+
               const { data: concurrenceData, error: concurrenceError } = await supabase
                 .from('concurrence')
                 .insert({
@@ -1268,7 +1286,7 @@ serve(async (req) => {
                   user_id: userId,
                   concurrent_principal: args.concurrent_principal,
                   postes: args.postes,
-                  secteur: args.secteur,
+                  secteur: finalSecteur,
                   sous_secteur: args.sous_secteur,
                   coefficient_observe: args.coefficient_observe,
                   statut: args.statut || 'actif',
@@ -1291,19 +1309,61 @@ serve(async (req) => {
                 .is('deleted_at', null);
               
               if (args.concurrent) concQuery = concQuery.ilike('concurrent_principal', `%${args.concurrent}%`);
-              if (args.secteur) concQuery = concQuery.eq('secteur', args.secteur);
               if (args.poste) concQuery = concQuery.contains('postes', [args.poste]);
+              
+              // Normalisation secteur: "hôtellerie restauration", "hôtellerie-restauration", "HR" → hôtellerie + restauration
+              let secteurFilters: string[] = [];
+              if (args.secteur) {
+                const secteurLower = args.secteur.toLowerCase().replace(/[-\s]/g, '');
+                if (secteurLower.includes('hr') || secteurLower.includes('hotellerierestau')) {
+                  secteurFilters = ['hôtellerie', 'restauration', 'hôtellerie-restauration'];
+                } else {
+                  secteurFilters = [args.secteur];
+                }
+              }
               
               const { data: concurrenceResults, error: concQueryError } = await concQuery;
               if (concQueryError) throw concQueryError;
               
+              // Filter by secteur if needed (OR logic for normalized sectors)
+              let filteredResults = concurrenceResults || [];
+              if (secteurFilters.length > 0) {
+                filteredResults = filteredResults.filter(c => 
+                  c.secteur && secteurFilters.some(sf => 
+                    c.secteur.toLowerCase().includes(sf.toLowerCase())
+                  )
+                );
+              }
+              
+              // Aggregate by concurrent_principal (Top 3)
+              type AggregatedConcurrent = { concurrent: string; count: number; coef_total: number };
+              const aggregated = filteredResults.reduce((acc, curr) => {
+                const concurrent = curr.concurrent_principal || 'Inconnu';
+                if (!acc[concurrent]) {
+                  acc[concurrent] = { concurrent, count: 0, coef_total: 0 };
+                }
+                acc[concurrent].count += 1;
+                acc[concurrent].coef_total += curr.coefficient_observe || 0;
+                return acc;
+              }, {} as Record<string, AggregatedConcurrent>);
+              
+              const topConcurrents = (Object.values(aggregated) as AggregatedConcurrent[])
+                .sort((a, b) => b.count - a.count)
+                .slice(0, 3)
+                .map(c => ({
+                  concurrent: c.concurrent,
+                  presence: c.count,
+                  coef_moyen: c.count > 0 ? (c.coef_total / c.count).toFixed(3) : null
+                }));
+              
               result = { 
                 success: true, 
-                data: concurrenceResults,
+                data: filteredResults,
                 summary: {
-                  total: concurrenceResults?.length || 0,
-                  coef_moyen: concurrenceResults?.length ? 
-                    (concurrenceResults.reduce((acc, c) => acc + (c.coefficient_observe || 0), 0) / concurrenceResults.length).toFixed(3) : 
+                  total: filteredResults.length,
+                  top_concurrents: topConcurrents,
+                  coef_moyen: filteredResults.length ? 
+                    (filteredResults.reduce((acc, c) => acc + (c.coefficient_observe || 0), 0) / filteredResults.length).toFixed(3) : 
                     null
                 }
               };
