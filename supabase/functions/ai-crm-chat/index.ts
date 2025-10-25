@@ -163,33 +163,55 @@ function parseFrenchDate(dateStr: string, defaultHour = 9, defaultMinute = 0): D
   return null;
 }
 
+// Helper function for fuzzy establishment matching
+function normalizeForMatch(text: string): string {
+  return text.toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // remove accents
+    .replace(/\b(de|du|de la|des|le|la|les|l')\b/g, '') // remove articles
+    .replace(/[^\w]/g, '') // remove punctuation/spaces
+    .trim();
+}
+
 // System prompt for the AI assistant
 const SYSTEM_PROMPT = `Tu es l'assistant IA du CRM ADAPTEL Lyon (agence de travail temporaire spécialisée en Hôtellerie/Restauration).
 
 TU ES UN VRAI ASSISTANT COMMERCIAL - PRINCIPES ABSOLUS :
 1. JAMAIS bloquer une action pour champs manquants → créer avec minimum, compléter plus tard
 2. TOUJOURS exécuter immédiatement ce qui est demandé
-3. TOUJOURS confirmer avec phrase simple et naturelle (pas de jargon technique)
+3. TOUJOURS confirmer avec phrase simple et naturelle (JAMAIS de JSON visible)
 4. JAMAIS poser de questions inutiles → deviner intelligemment ou prendre défaut raisonnable
-5. JAMAIS créer de doublons → chercher d'abord, mettre à jour si trouvé
+5. JAMAIS créer de doublons → TOUJOURS chercher d'abord avec search_etablissement_fuzzy
 6. TOUJOURS réessayer automatiquement en cas d'erreur technique
 
 GARDE-FOU INTERNE :
 - JAMAIS créer d'établissement pour ADAPTEL (notre société)
 - Si détecté "ADAPTEL", "ADAPTEL Lyon", "ADAPTEL Intérim", etc. → répondre : "C'est notre société, je n'enregistre pas d'établissement pour nous."
 
+IDENTIFICATION D'ÉTABLISSEMENT (RÈGLE CRITIQUE) :
+AVANT toute action (création, rappel, concurrence, contact) :
+1. TOUJOURS utiliser search_etablissement_fuzzy avec le nom mentionné + ville si présente
+2. Si 1 seul match confiant → l'utiliser directement (pas de question)
+3. Si 2-3 candidats plausibles → poser UNE confirmation courte :
+   "Vous parlez de :
+   1. Novotel Bron (Bron)
+   2. Novotel Lyon Bron (Saint-Priest)
+   3. Autre / Nouveau"
+4. Si "Autre/Nouveau" ou aucun match → créer nouveau (minimale)
+5. Si variante détectée (ex: "Novotel de Bron" → "Novotel Bron") → créer alias automatiquement (silencieux)
+
+ALIAS AUTOMATIQUES :
+- Quand une variante de nom est utilisée et reconnue → ajouter alias à la fiche (create_alias)
+- JAMAIS créer d'alias pour ADAPTEL
+- Silencieux : pas de message à l'utilisateur, juste faire
+
 CRÉATION TOLÉRANTE (JAMAIS BLOQUER) :
-- AVANT création : lookup doublon par nom_canonique/ville/alias pour le même user_id
-- Si trouvé → UPDATE au lieu de créer (fusion automatique)
-- Si nouveau statut "client actuel" et existant "prospect" → PROMOTION : type='client', statut_commercial='gagné'
-- Toujours créer avec socle minimal : nom + user_id + type
-- Mapping automatique du type depuis la phrase utilisateur :
+- Créer établissement UNIQUEMENT après search_etablissement_fuzzy sans résultat
+- Socle minimal : nom + user_id + type='prospect'
+- Mapping automatique du type :
   * "client actuel" / "client" → type='client', statut_commercial='gagné'
   * "prospect" → type='prospect', statut_commercial='à_contacter'
-  * sinon défaut → type='prospect', statut_commercial='à_contacter'
-- Ne JAMAIS demander ville, coefficient, groupe, adresse, code_postal s'ils manquent
-- Créer d'abord avec le minimum, puis UPDATE les champs présents
 - Si erreur DB → retry avec création minimale automatique
+- Si trouvé existant → UPDATE (pas de nouveau)
 
 MAPPING AUTOMATIQUE (zéro friction) :
 - "Client actuel Novotel Bron (Bron), coef 2.048, groupe ACCOR" → type='client', statut_commercial='gagné', ville='Bron', coefficient=2.048, groupe='ACCOR'
@@ -270,8 +292,23 @@ const tools = [
   {
     type: "function",
     function: {
+      name: "search_etablissement_fuzzy",
+      description: "OBLIGATOIRE AVANT toute action : recherche tolérante d'établissement (accents, articles, espaces, casse, abréviations). Retourne candidats triés par pertinence. Si 1 seul → auto-match. Si 2-3 → demander confirmation. Si 0 → créer.",
+      parameters: {
+        type: "object",
+        properties: {
+          nom: { type: "string", description: "Nom recherché (obligatoire)" },
+          ville: { type: "string", description: "Ville (optionnel, améliore pertinence)" }
+        },
+        required: ["nom"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "create_etablissement",
-      description: "Créer un nouvel établissement. Mapping auto: 'client actuel'→type='client'+statut_commercial='gagné', 'prospect'→type='prospect'+statut_commercial='à_contacter'. JAMAIS bloquer si champs manquants (ville, coef, groupe, etc.)",
+      description: "Créer un nouvel établissement UNIQUEMENT après search_etablissement_fuzzy sans résultat. Mapping auto: 'client actuel'→type='client'+statut_commercial='gagné', 'prospect'→type='prospect'+statut_commercial='à_contacter'. JAMAIS bloquer si champs manquants (ville, coef, groupe, etc.)",
       parameters: {
         type: "object",
         properties: {
@@ -559,14 +596,14 @@ const tools = [
     type: "function",
     function: {
       name: "create_alias",
-      description: "Ajouter un alias pour un établissement (variantes de nom)",
+      description: "Ajouter AUTOMATIQUEMENT un alias pour un établissement (variantes de nom). SILENCIEUX : pas de message à l'utilisateur.",
       parameters: {
         type: "object",
         properties: {
-          etablissement_nom: { type: "string", description: "Nom de l'établissement" },
+          etablissement_id: { type: "string", description: "ID de l'établissement (UUID)" },
           alias: { type: "string", description: "Alias (variante du nom)" }
         },
-        required: ["etablissement_nom", "alias"]
+        required: ["etablissement_id", "alias"]
       }
     }
   }
@@ -639,6 +676,127 @@ serve(async (req) => {
         
         try {
           switch (functionName) {
+            case 'search_etablissement_fuzzy':
+              const searchNom = args.nom;
+              const searchVille = args.ville;
+              const normalizedSearch = normalizeForMatch(searchNom);
+              
+              // Get all etablissements for user
+              const { data: etablissementsForFuzzy } = await supabase
+                .from('etablissements')
+                .select('id, nom, nom_canonique, ville, type, secteur, groupe, coefficient, created_at')
+                .eq('user_id', userId)
+                .is('deleted_at', null);
+              
+              if (!etablissementsForFuzzy || etablissementsForFuzzy.length === 0) {
+                result = { 
+                  success: true, 
+                  matches: [],
+                  message: "Aucun établissement trouvé" 
+                };
+                break;
+              }
+              
+              // Get aliases
+              const etabIds = etablissementsForFuzzy.map(e => e.id);
+              const { data: aliases } = await supabase
+                .from('etablissements_aliases')
+                .select('etablissement_id, alias')
+                .in('etablissement_id', etabIds);
+              
+              const aliasMap = new Map<string, string[]>();
+              aliases?.forEach(a => {
+                const existing = aliasMap.get(a.etablissement_id) || [];
+                aliasMap.set(a.etablissement_id, [...existing, a.alias]);
+              });
+              
+              // Score each etablissement
+              type ScoredMatch = {
+                id: string;
+                nom: string;
+                ville: string | null;
+                type: string;
+                score: number;
+                matchType: string;
+              };
+              
+              const matches: ScoredMatch[] = [];
+              
+              for (const etab of etablissementsForFuzzy) {
+                let score = 0;
+                let matchType = '';
+                
+                const normalizedNom = normalizeForMatch(etab.nom);
+                const etabAliases = aliasMap.get(etab.id) || [];
+                
+                // Exact match (normalized)
+                if (normalizedNom === normalizedSearch) {
+                  score = 100;
+                  matchType = 'exact';
+                }
+                // Alias exact match
+                else if (etabAliases.some(a => normalizeForMatch(a) === normalizedSearch)) {
+                  score = 95;
+                  matchType = 'alias_exact';
+                }
+                // Contains (nom)
+                else if (normalizedNom.includes(normalizedSearch) || normalizedSearch.includes(normalizedNom)) {
+                  score = 70;
+                  matchType = 'contains';
+                }
+                // Alias contains
+                else if (etabAliases.some(a => {
+                  const na = normalizeForMatch(a);
+                  return na.includes(normalizedSearch) || normalizedSearch.includes(na);
+                })) {
+                  score = 65;
+                  matchType = 'alias_contains';
+                }
+                // Partial word match (first 5 chars)
+                else if (normalizedNom.length >= 5 && normalizedSearch.length >= 5 && 
+                         normalizedNom.substring(0, 5) === normalizedSearch.substring(0, 5)) {
+                  score = 50;
+                  matchType = 'partial';
+                }
+                
+                // Bonus if ville matches
+                if (score > 0 && searchVille && etab.ville) {
+                  const normalizedEtabVille = normalizeForMatch(etab.ville);
+                  const normalizedSearchVille = normalizeForMatch(searchVille);
+                  if (normalizedEtabVille === normalizedSearchVille) {
+                    score += 20;
+                    matchType += '_ville';
+                  }
+                }
+                
+                if (score > 0) {
+                  matches.push({
+                    id: etab.id,
+                    nom: etab.nom,
+                    ville: etab.ville,
+                    type: etab.type,
+                    score,
+                    matchType
+                  });
+                }
+              }
+              
+              // Sort by score desc
+              matches.sort((a, b) => b.score - a.score);
+              
+              // Take top 3
+              const topMatches = matches.slice(0, 3);
+              
+              result = { 
+                success: true, 
+                matches: topMatches,
+                count: topMatches.length,
+                message: topMatches.length === 0 ? "Aucune correspondance" :
+                         topMatches.length === 1 ? `1 correspondance : ${topMatches[0].nom}` :
+                         `${topMatches.length} correspondances possibles`
+              };
+              break;
+
             case 'create_etablissement':
               try {
                 // GARDE-FOU INTERNE : Blacklist ADAPTEL
@@ -1634,30 +1792,45 @@ serve(async (req) => {
               break;
 
             case 'create_alias':
-              const { data: etabAlias } = await supabase
-                .from('etablissements')
+              // Blacklist ADAPTEL
+              const aliasLowerAdaptel = args.alias.toLowerCase()
+                .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+              if (aliasLowerAdaptel.includes('adaptel')) {
+                result = { 
+                  success: false, 
+                  error: "Ne pas créer d'alias pour ADAPTEL" 
+                };
+                break;
+              }
+
+              // Check if alias already exists
+              const { data: existingAlias } = await supabase
+                .from('etablissements_aliases')
                 .select('id')
-                .eq('nom', args.etablissement_nom)
-                .eq('user_id', userId)
-                .is('deleted_at', null)
+                .eq('etablissement_id', args.etablissement_id)
+                .eq('alias', args.alias)
                 .single();
               
-              if (!etabAlias) {
-                result = { success: false, error: 'Établissement non trouvé' };
+              if (existingAlias) {
+                result = { success: true, message: "Alias déjà existant (skip)" };
                 break;
               }
 
               const { data: aliasData, error: aliasError } = await supabase
                 .from('etablissements_aliases')
                 .insert({
-                  etablissement_id: etabAlias.id,
+                  etablissement_id: args.etablissement_id,
                   alias: args.alias
                 })
                 .select()
                 .single();
               
-              if (aliasError) throw aliasError;
-              result = { success: true, data: aliasData, message: `Alias "${args.alias}" ajouté` };
+              if (aliasError) {
+                console.warn('Error creating alias:', aliasError);
+                result = { success: false, error: aliasError.message };
+              } else {
+                result = { success: true, data: aliasData };
+              }
               break;
 
             default:
