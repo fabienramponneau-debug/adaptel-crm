@@ -166,80 +166,104 @@ function parseFrenchDate(dateStr: string, defaultHour = 9, defaultMinute = 0): D
 // System prompt for the AI assistant
 const SYSTEM_PROMPT = `Tu es l'assistant IA du CRM ADAPTEL Lyon (agence de travail temporaire spécialisée en Hôtellerie/Restauration).
 
+TU ES UN VRAI ASSISTANT COMMERCIAL - PRINCIPES ABSOLUS :
+1. JAMAIS bloquer une action pour champs manquants → créer avec minimum, compléter plus tard
+2. TOUJOURS exécuter immédiatement ce qui est demandé
+3. TOUJOURS confirmer avec phrase simple et naturelle (pas de jargon technique)
+4. JAMAIS poser de questions inutiles → deviner intelligemment ou prendre défaut raisonnable
+5. JAMAIS créer de doublons → chercher d'abord, mettre à jour si trouvé
+6. TOUJOURS réessayer automatiquement en cas d'erreur technique
+
 GARDE-FOU INTERNE :
-- JAMAIS créer d'établissement pour notre propre société ADAPTEL (tolérer accents/casse)
+- JAMAIS créer d'établissement pour ADAPTEL (notre société)
 - Si détecté "ADAPTEL", "ADAPTEL Lyon", "ADAPTEL Intérim", etc. → répondre : "C'est notre société, je n'enregistre pas d'établissement pour nous."
 
 CRÉATION TOLÉRANTE (JAMAIS BLOQUER) :
 - AVANT création : lookup doublon par nom_canonique/ville/alias pour le même user_id
-- Si trouvé → UPDATE au lieu de créer une nouvelle fiche
-- Si nouveau statut "client actuel" et existant "prospect" → PROMOTION : type='client', statut_commercial='gagné', log promotion
+- Si trouvé → UPDATE au lieu de créer (fusion automatique)
+- Si nouveau statut "client actuel" et existant "prospect" → PROMOTION : type='client', statut_commercial='gagné'
 - Toujours créer avec socle minimal : nom + user_id + type
 - Mapping automatique du type depuis la phrase utilisateur :
-  * "client actuel" → type='client', statut_commercial='gagné'
+  * "client actuel" / "client" → type='client', statut_commercial='gagné'
   * "prospect" → type='prospect', statut_commercial='à_contacter'
   * sinon défaut → type='prospect', statut_commercial='à_contacter'
 - Ne JAMAIS demander ville, coefficient, groupe, adresse, code_postal s'ils manquent
-- Créer d'abord avec le minimum, puis UPDATE les champs présents (nullable si manquants)
-- Si erreur DB (NOT NULL, FK, etc.) → retry avec création minimale automatique
+- Créer d'abord avec le minimum, puis UPDATE les champs présents
+- Si erreur DB → retry avec création minimale automatique
 
 MAPPING AUTOMATIQUE (zéro friction) :
 - "Client actuel Novotel Bron (Bron), coef 2.048, groupe ACCOR" → type='client', statut_commercial='gagné', ville='Bron', coefficient=2.048, groupe='ACCOR'
-- "Prospect Hôtel Y (Lyon) — cherche cuisiniers" → type='prospect', statut_commercial='à_contacter', ville='Lyon', info_libre={postes:['cuisine']}
-- "RDV demain 15h" → action type='rdv' + rappel_le automatique (1h avant)
+- "Prospect Hôtel Y (Lyon)" → type='prospect', statut_commercial='à_contacter', ville='Lyon'
+- "RDV demain 15h" → action type='visite' + rappel_le automatique (1h avant)
 - "Dis à Céline d'appeler..." → assigne_a (via utilisateurs_internes)
 - Tout hors schéma → info_libre jsonb
 
 SECTEURS : hôtellerie, restauration, hôtellerie-restauration, restauration_collective
 SOUS-SECTEURS : hôtel_1..5_étoiles, EHPAD, crèche, scolaire, résidence_hôtelière, etc.
-NORMALISATION SECTEUR : "hôtellerie restauration", "hôtellerie-restauration", "HR" → traiter comme 'hôtellerie' ET 'restauration'
+NORMALISATION SECTEUR : "hôtellerie restauration", "HR" → traiter comme 'hôtellerie' ET 'restauration'
 
-DÉDUPLICATION SILENCIEUSE (par défaut) :
+DÉDUPLICATION SILENCIEUSE :
 - Vérifier nom_canonique + ville + aliases avant création
-- Si doublon probable détecté SANS consigne explicite :
-  * Garder fiche avec + contacts/actions, sinon + récente (updated_at → created_at)
-  * Fusion auto : re-router contacts/actions, soft delete doublon, log historique
-  * En égalité parfaite → une seule clarification (deux cartes synthèse), sinon auto
-- "Fusionne X avec Y" ou "Résous les doublons" → garde X comme maître ou auto-résolution
+- Si doublon détecté → UPDATE fiche existante (pas de nouvelle fiche)
+- Log historique de la fusion
 
 NOM CANONIQUE & ALIASES :
 - Calcule automatiquement nom_canonique (minuscule, sans accents, sans espaces)
-- Si variante de nom détectée → crée etablissements_aliases SANS demander
+- Si variante de nom détectée → crée etablissements_aliases automatiquement
 
 DATES FRANÇAISES (parsing robuste) :
 - Formats naturels : "11 novembre", "11 nov", "11 novembre 2025"
-- Formats numériques : "11/11", "11/11/25", "11-11-2025", "11/11/2025"
+- Formats numériques : "11/11", "11/11/25", "11-11-2025"
 - Relatifs : "demain", "après-demain", "lundi", "lundi 15h", "dans 2 jours", "dans 3 semaines", "la semaine prochaine"
 - Heure optionnelle : si présente (15h, 15:30) l'utiliser, sinon défaut 09:00
-- Année manquante : interpréter dans l'année courante ; si déjà passée cette année → année +1
+- Année manquante : année courante ; si date passée → année +1
 - Fuseau : Europe/Paris (toujours)
-- Si date ambiguë/invalide → message court "Date ambiguë : précise le jour/mois/année ou une heure" SANS bloquer le reste
+- Si date ambiguë → message court "Date ambiguë" SANS bloquer le reste
 
-RAPPELS (création fiable - CRITIQUE - 100% réussite) :
+RAPPELS - CRITIQUE (100% réussite garantie) :
 - Pour "rappelle-moi..." / "enregistre un rappel {date} ... {Établissement}" :
-  * Fuzzy-match établissement (nom canonique/alias/ville)
-  * Si aucun match → création minimale automatique (nom + type='prospect' + user_id), log { created_establishment_id, nom }
-  * Type action : 'rappel' (ou 'appel' si le texte le suggère)
-  * OBLIGATOIRE : remplir date ET rappel_le avec la MÊME valeur datetime normalisée
+  * Fuzzy-match établissement (nom/nom_canonique/alias/ville)
+  * Si pas trouvé → création minimale AUTOMATIQUE (nom + type='prospect' + user_id)
+  * Type action : TOUJOURS 'appel' (la contrainte DB n'accepte que : appel, visite, mail, autre)
+  * OBLIGATOIRE : remplir date ET rappel_le avec la MÊME valeur datetime
   * Toujours user_id = auth.uid()
-  * Ne jamais bloquer si ville/coef/groupe manquent
-  * Log avant insert : { user_id, etablissement_id, date, rappel_le, type }
-  * Si échec NOT NULL / RLS / FK → retry : recréer établissement minimal + insert action immédiatement
+  * Ne JAMAIS bloquer si ville/coef/groupe manquent
+  * Si échec → retry automatique (recréer établissement + action)
+  * Confirmation naturelle : "✓ Rappel enregistré pour {date} : {commentaire} ({établissement})"
+
+TYPES D'ACTIONS VALIDES (contrainte DB stricte) :
+- 'appel' : pour appels téléphoniques ET rappels (rappel_le indique si c'est un rappel)
+- 'visite' : pour visites/RDV en personne
+- 'mail' : pour emails
+- 'autre' : pour toute autre action
 
 CONCURRENCE :
-- postes[], secteur (hérité de l'établissement si absent), coefficient_observe, statut (actif/historique/pressenti)
-- Requête "Quel concurrent le plus présent sur {secteur}" → agréger par concurrent_principal, Top 3 (avec compte)
-- Requête "Quels concurrents en base" → liste distincte concurrent_principal avec compte associé (Top 10)
+- postes[], secteur (hérité de l'établissement si absent), coefficient_observe, statut
+- "Quel concurrent le plus présent sur {secteur}" → Top 3 avec décompte
+- "Quels concurrents en base" → liste distincte Top 10
 
-RAPPELS & ACTIONS (requêtes) :
-- "Quels rappels pour moi ?" / "Rappels de la semaine" → actions type IN ('rappel','appel'), rappel_le dans période, user_id=auth.uid()
-- "Quelles actions commerciales en cours ?" → actions date >= now() - 30 jours, user_id=auth.uid(), hors soft-deleted
+REQUÊTES RAPPELS & ACTIONS :
+- "Rappels de la semaine" / "Mes rappels" → actions type='appel' avec rappel_le dans période
+- "Actions commerciales en cours" → actions récentes (30 derniers jours)
 
 ASSIGNATIONS : "Dis à Céline..." → assigne_a
 SUPPRESSION : toujours soft delete (deleted_at)
 
+CONFIRMATIONS (OBLIGATOIRE après chaque action) :
+- Utilise TOUJOURS le message de confirmation fourni par l'outil (champ "message" dans tool_result)
+- Si l'outil retourne un message, répète-le textuellement à l'utilisateur (ne le reformule pas)
+- Si pas de message fourni, utilise ces formats :
+  * Création établissement : "✓ {Nom} enregistré comme {type} ({ville si présente})"
+  * Promotion prospect→client : "✓ {Nom} promu de prospect à client"
+  * Rappel créé : "✓ Rappel enregistré pour {date} : {commentaire}"
+  * Action créée : "✓ Action {type} enregistrée pour {établissement}"
+  * Mise à jour : "✓ {Nom} mis à jour"
+  * Fusion doublon : "✓ {Nom} fusionné avec fiche existante"
+- Sois bref, naturel, sans jargon technique
+- Un seul symbole ✓ par confirmation
+
 Date du jour : ${new Date().toISOString()}
-Réponds en français de façon naturelle et JAMAIS BLOQUER sur champs manquants.`;
+Réponds toujours en français de façon naturelle et fluide.`;
 
 // Tools definition for structured output
 const tools = [
@@ -300,7 +324,7 @@ const tools = [
     type: "function",
     function: {
           name: "create_action",
-          description: "Créer une action commerciale ou un rappel. Pour rappels: type='rappel' ou 'appel', date ET rappel_le doivent être identiques",
+          description: "Créer une action commerciale ou un rappel. CRITIQUE: Pour rappels utiliser type='appel' (contrainte DB), date ET rappel_le identiques",
           parameters: {
             type: "object",
             properties: {
@@ -308,13 +332,13 @@ const tools = [
               contact_nom: { type: "string", description: "Nom du contact lié (optionnel)" },
               type: { 
                 type: "string", 
-                enum: ["appel", "visite", "mail", "rdv", "rappel", "autre"],
-                description: "Type d'action: 'rappel' ou 'appel' pour rappels, 'rdv' pour rendez-vous, etc."
+                enum: ["appel", "visite", "mail", "autre"],
+                description: "Type d'action VALIDE uniquement: 'appel' (pour appels ET rappels), 'visite' (pour RDV), 'mail', 'autre'. La DB n'accepte PAS 'rappel' ni 'rdv'."
               },
               date: { type: "string", description: "Date de l'action au format ISO 8601 ou FR (OBLIGATOIRE)" },
-              rappel_le: { type: "string", description: "Date du rappel (pour rappels: MÊME valeur que date; pour RDV: auto 1h avant)" },
-              commentaire: { type: "string", description: "Commentaire sur l'action" },
-              resultat: { type: "string", description: "Résultat de l'action" },
+              rappel_le: { type: "string", description: "Date du rappel (pour rappels: MÊME valeur que date; pour visites: auto 1h avant)" },
+              commentaire: { type: "string", description: "Commentaire/description de l'action" },
+              resultat: { type: "string", description: "Résultat de l'action (optionnel)" },
               assigne_a_name: { type: "string", description: "Prénom du collaborateur à qui assigner (optionnel)" },
               info_libre: { type: "object", description: "Données hors schéma (jsonb)" }
             },
@@ -345,7 +369,7 @@ const tools = [
     type: "function",
     function: {
       name: "search_actions",
-      description: "Rechercher des actions/rappels selon des critères",
+      description: "Rechercher des actions/rappels selon des critères. Pour rappels: filtrer type='appel' avec rappel_le non null",
       parameters: {
         type: "object",
         properties: {
@@ -353,7 +377,7 @@ const tools = [
           type: { 
             type: "string", 
             enum: ["appel", "visite", "mail", "autre"],
-            description: "Type d'action"
+            description: "Type d'action valide"
           },
           date_debut: { type: "string", description: "Date de début au format ISO 8601" },
           date_fin: { type: "string", description: "Date de fin au format ISO 8601" }
@@ -752,8 +776,8 @@ serve(async (req) => {
                     });
                     
                     const message = promotionApplied 
-                      ? `✓ Établissement "${args.nom}" promu de prospect à client et fusionné avec "${duplicate.nom}".`
-                      : `✓ Établissement "${args.nom}" identifié comme doublon de "${duplicate.nom}" et fusionné automatiquement.`;
+                      ? `✓ ${args.nom} promu de prospect à client${duplicate.ville ? ' ('+duplicate.ville+')' : ''}`
+                      : `✓ ${args.nom} mis à jour${duplicate.ville ? ' ('+duplicate.ville+')' : ''}`;
                     
                     result = { 
                       success: true, 
@@ -859,7 +883,13 @@ serve(async (req) => {
                 }
                 
                 console.log('Etablissement created successfully:', etabData);
-                result = { success: true, data: etabData };
+                const typeLabel = etabData.type === 'client' ? 'client' : 'prospect';
+                const villeInfo = etabData.ville ? ` (${etabData.ville})` : '';
+                result = { 
+                  success: true, 
+                  data: etabData,
+                  message: `✓ ${etabData.nom} enregistré comme ${typeLabel}${villeInfo}`
+                };
                 
               } catch (error) {
                 console.error('Error in create_etablissement:', error);
@@ -903,7 +933,11 @@ serve(async (req) => {
                 .single();
               
               if (contactError) throw contactError;
-              result = { success: true, data: contactData };
+              result = { 
+                success: true, 
+                data: contactData,
+                message: `✓ Contact ${contactData.prenom} ${contactData.nom} enregistré`
+              };
               break;
 
             case 'create_action':
@@ -1017,8 +1051,13 @@ serve(async (req) => {
                   }
                 }
                 
-                // CRITIQUE: Pour rappels, date ET rappel_le doivent être identiques
-                if (args.type === 'rappel' || args.type === 'appel') {
+                // CRITIQUE: Pour rappels (type='appel' avec rappel_le), date ET rappel_le identiques
+                // Si commentaire contient "rappel" → c'est un rappel, donc rappel_le = date
+                const isRappel = args.commentaire?.toLowerCase().includes('rappel') || 
+                                 args.commentaire?.toLowerCase().includes('relancer') ||
+                                 args.rappel_le;
+                
+                if (isRappel && args.type === 'appel') {
                   rappelLe = actionDate ? actionDate.toISOString() : new Date().toISOString();
                 } else if (args.rappel_le) {
                   // Parse explicit rappel_le
@@ -1026,8 +1065,8 @@ serve(async (req) => {
                   if (!rappelLe) {
                     console.warn(`Rappel date "${args.rappel_le}" invalide, ignoré`);
                   }
-                } else if (actionDate && args.type === 'rdv') {
-                  // Auto-set rappel_le for RDV: 1h before
+                } else if (actionDate && args.type === 'visite') {
+                  // Auto-set rappel_le for visites: 1h before
                   rappelLe = new Date(actionDate.getTime() - 60 * 60 * 1000).toISOString();
                 }
 
@@ -1125,7 +1164,27 @@ serve(async (req) => {
                   }
                 }
                 
-                result = { success: true, data: actionData };
+                // Confirmation message pour l'utilisateur
+                const isRappelConfirm = rappelLe && args.type === 'appel';
+                const typeLabel = isRappelConfirm ? 'Rappel' : 
+                                  args.type === 'visite' ? 'Visite' : 
+                                  args.type === 'mail' ? 'Email' : 
+                                  'Action';
+                const dateFormatted = actionDate ? 
+                  new Date(actionDate).toLocaleDateString('fr-FR', { 
+                    day: 'numeric', 
+                    month: 'long',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                  }) : 
+                  'aujourd\'hui';
+                const commentInfo = args.commentaire ? ` : ${args.commentaire}` : '';
+                
+                result = { 
+                  success: true, 
+                  data: actionData,
+                  message: `✓ ${typeLabel} enregistré pour ${dateFormatted}${commentInfo} (${etabForAction.nom})`
+                };
               } catch (error) {
                 console.error('Error in create_action:', error);
                 const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1505,7 +1564,8 @@ serve(async (req) => {
                 .from('actions')
                 .select('*, etablissements(nom, ville)')
                 .eq('user_id', userId)
-                .in('type', ['rappel', 'appel'])
+                .eq('type', 'appel')
+                .not('rappel_le', 'is', null)
                 .is('deleted_at', null)
                 .order('rappel_le', { ascending: true });
               
