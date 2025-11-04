@@ -175,10 +175,16 @@ function normalizeForMatch(text: string): string {
 // System prompt for the AI assistant
 const SYSTEM_PROMPT = `Tu es l'assistant IA du CRM ADAPTEL Lyon (agence de travail temporaire spécialisée en Hôtellerie/Restauration).
 
+RÈGLE D'OR : JAMAIS AFFICHER DE JSON NI D'OBJETS TECHNIQUES
+- Les outils retournent un champ "message" → répète-le EXACTEMENT tel quel à l'utilisateur
+- Ne reformule JAMAIS le message fourni par l'outil
+- Si l'outil ne fournit pas de message → utilise format simple : "✓ [Action] : [détails]"
+- INTERDIT : afficher des objets, des erreurs techniques brutes, des IDs, des JSON
+
 TU ES UN VRAI ASSISTANT COMMERCIAL - PRINCIPES ABSOLUS :
 1. JAMAIS bloquer une action pour champs manquants → créer avec minimum, compléter plus tard
 2. TOUJOURS exécuter immédiatement ce qui est demandé
-3. TOUJOURS confirmer avec phrase simple et naturelle (JAMAIS de JSON visible)
+3. TOUJOURS confirmer avec phrase simple et naturelle en français
 4. JAMAIS poser de questions inutiles → deviner intelligemment ou prendre défaut raisonnable
 5. JAMAIS créer de doublons → TOUJOURS chercher d'abord avec search_etablissement_fuzzy
 6. TOUJOURS réessayer automatiquement en cas d'erreur technique
@@ -188,21 +194,23 @@ GARDE-FOU INTERNE :
 - Si détecté "ADAPTEL", "ADAPTEL Lyon", "ADAPTEL Intérim", etc. → répondre : "C'est notre société, je n'enregistre pas d'établissement pour nous."
 
 IDENTIFICATION D'ÉTABLISSEMENT (RÈGLE CRITIQUE) :
-AVANT toute action (création, rappel, concurrence, contact) :
+AVANT toute action (création, rappel, concurrence, contact, info) :
 1. TOUJOURS utiliser search_etablissement_fuzzy avec le nom mentionné + ville si présente
-2. Si 1 seul match confiant → l'utiliser directement (pas de question)
-3. Si 2-3 candidats plausibles → poser UNE confirmation courte :
-   "Vous parlez de :
-   1. Novotel Bron (Bron)
-   2. Novotel Lyon Bron (Saint-Priest)
-   3. Autre / Nouveau"
-4. Si "Autre/Nouveau" ou aucun match → créer nouveau (minimale)
-5. Si variante détectée (ex: "Novotel de Bron" → "Novotel Bron") → créer alias automatiquement (silencieux)
+2. DÉCISIONS AUTOMATIQUES basées sur les résultats :
+   - 1 seul match (score ≥50) → l'utiliser DIRECTEMENT sans question
+   - 2-3 matches → poser UNE confirmation courte numérotée :
+     "Vous parlez de :
+     1. Novotel Bron (Bron)
+     2. Novotel Lyon Bron (Saint-Priest)
+     3. Autre / Nouveau"
+   - 0 match → créer nouveau établissement minimal
+3. Si variante détectée (nom utilisé ≠ nom trouvé) → créer alias AUTOMATIQUEMENT après succès (silencieux)
+   Exemple : utilisateur dit "Novotel de Bron", trouvé "Novotel Bron" → créer alias "Novotel de Bron"
 
-ALIAS AUTOMATIQUES :
-- Quand une variante de nom est utilisée et reconnue → ajouter alias à la fiche (create_alias)
+ALIAS AUTOMATIQUES (SILENCIEUX) :
+- Après chaque match fuzzy réussi où nom_recherché ≠ nom_trouvé → create_alias(etablissement_id, nom_recherché)
 - JAMAIS créer d'alias pour ADAPTEL
-- Silencieux : pas de message à l'utilisateur, juste faire
+- JAMAIS mentionner la création d'alias à l'utilisateur (transparent)
 
 CRÉATION TOLÉRANTE (JAMAIS BLOQUER) :
 - Créer établissement UNIQUEMENT après search_etablissement_fuzzy sans résultat
@@ -240,11 +248,11 @@ DATES FRANÇAISES (parsing robuste) :
 - Heure optionnelle : si présente (15h, 15:30) l'utiliser, sinon défaut 09:00
 - Année manquante : année courante ; si date passée → année +1
 - Fuseau : Europe/Paris (toujours)
-- Si date ambiguë → message court "Date ambiguë" SANS bloquer le reste
+- Si date ambiguë → message court "Date non reconnue, précise le format" SANS bloquer le reste
 
 RAPPELS - CRITIQUE (100% réussite garantie) :
 - Pour "rappelle-moi..." / "enregistre un rappel {date} ... {Établissement}" :
-  * Fuzzy-match établissement (nom/nom_canonique/alias/ville)
+  * TOUJOURS faire search_etablissement_fuzzy d'abord
   * Si pas trouvé → création minimale AUTOMATIQUE (nom + type='prospect' + user_id)
   * Type action : TOUJOURS 'appel' (la contrainte DB n'accepte que : appel, visite, mail, autre)
   * OBLIGATOIRE : remplir date ET rappel_le avec la MÊME valeur datetime
@@ -260,9 +268,18 @@ TYPES D'ACTIONS VALIDES (contrainte DB stricte) :
 - 'autre' : pour toute autre action
 
 CONCURRENCE :
+- TOUJOURS faire search_etablissement_fuzzy avant manage_concurrence
 - postes[], secteur (hérité de l'établissement si absent), coefficient_observe, statut
 - "Quel concurrent le plus présent sur {secteur}" → Top 3 avec décompte
 - "Quels concurrents en base" → liste distincte Top 10
+
+CONTACTS :
+- TOUJOURS faire search_etablissement_fuzzy avant create_contact
+- Si établissement non trouvé → créer minimal automatiquement puis créer contact
+
+INFO ÉTABLISSEMENT :
+- TOUJOURS faire search_etablissement_fuzzy avant get_etablissement_info
+- Afficher les infos de façon naturelle et structurée
 
 REQUÊTES RAPPELS & ACTIONS :
 - "Rappels de la semaine" / "Mes rappels" → actions type='appel' avec rappel_le dans période
@@ -272,17 +289,18 @@ ASSIGNATIONS : "Dis à Céline..." → assigne_a
 SUPPRESSION : toujours soft delete (deleted_at)
 
 CONFIRMATIONS (OBLIGATOIRE après chaque action) :
-- Utilise TOUJOURS le message de confirmation fourni par l'outil (champ "message" dans tool_result)
-- Si l'outil retourne un message, répète-le textuellement à l'utilisateur (ne le reformule pas)
-- Si pas de message fourni, utilise ces formats :
-  * Création établissement : "✓ {Nom} enregistré comme {type} ({ville si présente})"
+- Utilise TOUJOURS et EXACTEMENT le message de confirmation fourni par l'outil (champ "message" dans tool_result)
+- Ne JAMAIS reformuler le message de l'outil
+- Si pas de message fourni, utilise ces formats simples :
+  * Création établissement : "✓ {Nom} enregistré comme {type}"
   * Promotion prospect→client : "✓ {Nom} promu de prospect à client"
-  * Rappel créé : "✓ Rappel enregistré pour {date} : {commentaire}"
-  * Action créée : "✓ Action {type} enregistrée pour {établissement}"
+  * Rappel créé : "✓ Rappel enregistré pour {date}"
+  * Action créée : "✓ Action {type} enregistrée"
   * Mise à jour : "✓ {Nom} mis à jour"
   * Fusion doublon : "✓ {Nom} fusionné avec fiche existante"
 - Sois bref, naturel, sans jargon technique
 - Un seul symbole ✓ par confirmation
+- JAMAIS afficher d'objets JSON, d'IDs, ou d'erreurs techniques
 
 Date du jour : ${new Date().toISOString()}
 Réponds toujours en français de façon naturelle et fluide.`;
@@ -1060,17 +1078,98 @@ serve(async (req) => {
               break;
 
             case 'create_contact':
-              // Find etablissement first
-              const { data: etabForContact } = await supabase
-                .from('etablissements')
-                .select('id')
-                .eq('nom', args.etablissement_nom)
-                .eq('user_id', userId)
-                .single();
+              // MUST use fuzzy search first
+              const searchContactNom = args.etablissement_nom;
+              const normalizedSearchContact = normalizeForMatch(searchContactNom);
               
+              const { data: etabsForContact } = await supabase
+                .from('etablissements')
+                .select('id, nom, nom_canonique, ville')
+                .eq('user_id', userId)
+                .is('deleted_at', null);
+              
+              let etabForContact = null;
+              
+              if (etabsForContact && etabsForContact.length > 0) {
+                // Get aliases for matching
+                const etabIdsContact = etabsForContact.map(e => e.id);
+                const { data: aliasesContact } = await supabase
+                  .from('etablissements_aliases')
+                  .select('etablissement_id, alias')
+                  .in('etablissement_id', etabIdsContact);
+                
+                const aliasMapContact = new Map<string, string[]>();
+                aliasesContact?.forEach(a => {
+                  const existing = aliasMapContact.get(a.etablissement_id) || [];
+                  aliasMapContact.set(a.etablissement_id, [...existing, a.alias]);
+                });
+                
+                // Find best match
+                let bestMatch: { id: string; nom: string; score: number } | null = null;
+                
+                for (const etab of etabsForContact) {
+                  let score = 0;
+                  const normalizedNom = normalizeForMatch(etab.nom);
+                  const etabAliases = aliasMapContact.get(etab.id) || [];
+                  
+                  if (normalizedNom === normalizedSearchContact) {
+                    score = 100;
+                  } else if (etabAliases.some(a => normalizeForMatch(a) === normalizedSearchContact)) {
+                    score = 95;
+                  } else if (normalizedNom.includes(normalizedSearchContact) || normalizedSearchContact.includes(normalizedNom)) {
+                    score = 70;
+                  }
+                  
+                  if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+                    bestMatch = { id: etab.id, nom: etab.nom, score };
+                  }
+                }
+                
+                if (bestMatch) {
+                  etabForContact = { id: bestMatch.id, nom: bestMatch.nom };
+                  
+                  // Create alias if variant detected
+                  if (normalizeForMatch(searchContactNom) !== normalizeForMatch(bestMatch.nom)) {
+                    await supabase
+                      .from('etablissements_aliases')
+                      .insert({
+                        etablissement_id: bestMatch.id,
+                        alias: searchContactNom
+                      })
+                      .select();
+                  }
+                }
+              }
+              
+              // If not found, create minimal etablissement
               if (!etabForContact) {
-                result = { success: false, error: 'Établissement non trouvé' };
-                break;
+                console.log(`Établissement "${args.etablissement_nom}" non trouvé, création minimale automatique`);
+                const nomCanoniqueContact = args.etablissement_nom.toLowerCase()
+                  .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                  .replace(/\s+/g, '');
+                
+                const { data: newEtabContact, error: createContactEtabError } = await supabase
+                  .from('etablissements')
+                  .insert({
+                    nom: args.etablissement_nom,
+                    nom_canonique: nomCanoniqueContact,
+                    type: 'prospect',
+                    statut_commercial: 'à_contacter',
+                    user_id: userId
+                  })
+                  .select('id, nom')
+                  .single();
+                
+                if (createContactEtabError) {
+                  console.error('Error creating minimal etablissement for contact:', createContactEtabError);
+                  result = { 
+                    success: false, 
+                    error: `Établissement "${args.etablissement_nom}" non trouvé et création impossible: ${createContactEtabError.message}` 
+                  };
+                  break;
+                }
+                
+                etabForContact = newEtabContact;
               }
 
               const { data: contactData, error: contactError } = await supabase
@@ -1397,11 +1496,82 @@ serve(async (req) => {
               break;
 
             case 'get_etablissement_info':
+              // MUST use fuzzy search first
+              const searchInfoNom = args.nom;
+              const normalizedSearchInfo = normalizeForMatch(searchInfoNom);
+              
+              const { data: etabsForInfo } = await supabase
+                .from('etablissements')
+                .select('id, nom, nom_canonique, ville')
+                .eq('user_id', userId)
+                .is('deleted_at', null);
+              
+              if (!etabsForInfo || etabsForInfo.length === 0) {
+                result = { 
+                  success: false, 
+                  message: `Aucun établissement trouvé pour "${args.nom}"` 
+                };
+                break;
+              }
+              
+              // Get aliases for matching
+              const etabIdsInfo = etabsForInfo.map(e => e.id);
+              const { data: aliasesInfo } = await supabase
+                .from('etablissements_aliases')
+                .select('etablissement_id, alias')
+                .in('etablissement_id', etabIdsInfo);
+              
+              const aliasMapInfo = new Map<string, string[]>();
+              aliasesInfo?.forEach(a => {
+                const existing = aliasMapInfo.get(a.etablissement_id) || [];
+                aliasMapInfo.set(a.etablissement_id, [...existing, a.alias]);
+              });
+              
+              // Find best match
+              let bestMatch: { id: string; nom: string; score: number } | null = null;
+              
+              for (const etab of etabsForInfo) {
+                let score = 0;
+                const normalizedNom = normalizeForMatch(etab.nom);
+                const etabAliases = aliasMapInfo.get(etab.id) || [];
+                
+                if (normalizedNom === normalizedSearchInfo) {
+                  score = 100;
+                } else if (etabAliases.some(a => normalizeForMatch(a) === normalizedSearchInfo)) {
+                  score = 95;
+                } else if (normalizedNom.includes(normalizedSearchInfo) || normalizedSearchInfo.includes(normalizedNom)) {
+                  score = 70;
+                }
+                
+                if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+                  bestMatch = { id: etab.id, nom: etab.nom, score };
+                }
+              }
+              
+              if (!bestMatch) {
+                result = { 
+                  success: false, 
+                  message: `Établissement "${args.nom}" non trouvé` 
+                };
+                break;
+              }
+              
+              // Create alias if variant detected
+              if (normalizeForMatch(searchInfoNom) !== normalizeForMatch(bestMatch.nom)) {
+                await supabase
+                  .from('etablissements_aliases')
+                  .insert({
+                    etablissement_id: bestMatch.id,
+                    alias: searchInfoNom
+                  })
+                  .select();
+              }
+              
+              // Get full info
               const { data: etabInfo, error: etabInfoError } = await supabase
                 .from('etablissements')
                 .select('*, contacts(*), actions(*), concurrence(*)')
-                .eq('nom', args.nom)
-                .eq('user_id', userId)
+                .eq('id', bestMatch.id)
                 .single();
               
               if (etabInfoError) throw etabInfoError;
@@ -1610,17 +1780,98 @@ serve(async (req) => {
               break;
 
             case 'manage_concurrence':
-              const { data: etabConcurrence } = await supabase
-                .from('etablissements')
-                .select('id, secteur')
-                .eq('nom', args.etablissement_nom)
-                .eq('user_id', userId)
-                .is('deleted_at', null)
-                .single();
+              // MUST use fuzzy search first
+              const searchConcurrenceNom = args.etablissement_nom;
+              const normalizedSearchConcurrence = normalizeForMatch(searchConcurrenceNom);
               
+              const { data: etabsForConcurrence } = await supabase
+                .from('etablissements')
+                .select('id, nom, nom_canonique, ville, secteur')
+                .eq('user_id', userId)
+                .is('deleted_at', null);
+              
+              let etabConcurrence = null;
+              
+              if (etabsForConcurrence && etabsForConcurrence.length > 0) {
+                // Get aliases for matching
+                const etabIdsConcurrence = etabsForConcurrence.map(e => e.id);
+                const { data: aliasesConcurrence } = await supabase
+                  .from('etablissements_aliases')
+                  .select('etablissement_id, alias')
+                  .in('etablissement_id', etabIdsConcurrence);
+                
+                const aliasMapConcurrence = new Map<string, string[]>();
+                aliasesConcurrence?.forEach(a => {
+                  const existing = aliasMapConcurrence.get(a.etablissement_id) || [];
+                  aliasMapConcurrence.set(a.etablissement_id, [...existing, a.alias]);
+                });
+                
+                // Find best match
+                let bestMatch: { id: string; nom: string; secteur: string | null; score: number } | null = null;
+                
+                for (const etab of etabsForConcurrence) {
+                  let score = 0;
+                  const normalizedNom = normalizeForMatch(etab.nom);
+                  const etabAliases = aliasMapConcurrence.get(etab.id) || [];
+                  
+                  if (normalizedNom === normalizedSearchConcurrence) {
+                    score = 100;
+                  } else if (etabAliases.some(a => normalizeForMatch(a) === normalizedSearchConcurrence)) {
+                    score = 95;
+                  } else if (normalizedNom.includes(normalizedSearchConcurrence) || normalizedSearchConcurrence.includes(normalizedNom)) {
+                    score = 70;
+                  }
+                  
+                  if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+                    bestMatch = { id: etab.id, nom: etab.nom, secteur: etab.secteur, score };
+                  }
+                }
+                
+                if (bestMatch) {
+                  etabConcurrence = { id: bestMatch.id, secteur: bestMatch.secteur };
+                  
+                  // Create alias if variant detected
+                  if (normalizeForMatch(searchConcurrenceNom) !== normalizeForMatch(bestMatch.nom)) {
+                    await supabase
+                      .from('etablissements_aliases')
+                      .insert({
+                        etablissement_id: bestMatch.id,
+                        alias: searchConcurrenceNom
+                      })
+                      .select();
+                  }
+                }
+              }
+              
+              // If not found, create minimal etablissement
               if (!etabConcurrence) {
-                result = { success: false, error: 'Établissement non trouvé' };
-                break;
+                console.log(`Établissement "${args.etablissement_nom}" non trouvé, création minimale automatique`);
+                const nomCanoniqueConcurrence = args.etablissement_nom.toLowerCase()
+                  .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                  .replace(/\s+/g, '');
+                
+                const { data: newEtabConcurrence, error: createConcurrenceEtabError } = await supabase
+                  .from('etablissements')
+                  .insert({
+                    nom: args.etablissement_nom,
+                    nom_canonique: nomCanoniqueConcurrence,
+                    type: 'prospect',
+                    statut_commercial: 'à_contacter',
+                    user_id: userId
+                  })
+                  .select('id, secteur')
+                  .single();
+                
+                if (createConcurrenceEtabError) {
+                  console.error('Error creating minimal etablissement for concurrence:', createConcurrenceEtabError);
+                  result = { 
+                    success: false, 
+                    error: `Établissement "${args.etablissement_nom}" non trouvé et création impossible: ${createConcurrenceEtabError.message}` 
+                  };
+                  break;
+                }
+                
+                etabConcurrence = newEtabConcurrence;
               }
 
               // Si secteur absent, hériter du secteur de l'établissement
@@ -1645,7 +1896,14 @@ serve(async (req) => {
                 .single();
               
               if (concurrenceError) throw concurrenceError;
-              result = { success: true, data: concurrenceData };
+              
+              const coefInfo = args.coefficient_observe ? `, coef ${args.coefficient_observe}` : '';
+              const postesInfo = args.postes && args.postes.length > 0 ? ` sur ${args.postes.join(', ')}` : '';
+              result = { 
+                success: true, 
+                data: concurrenceData,
+                message: `✓ Concurrence enregistrée : ${args.concurrent_principal}${coefInfo}${postesInfo}`
+              };
               break;
 
             case 'query_concurrence':
